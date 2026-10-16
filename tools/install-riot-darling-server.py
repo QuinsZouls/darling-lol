@@ -83,10 +83,17 @@ def install(source, destination, backups):
     }
 
 
+def default_server_destination():
+    """The packaged server's path. Never a literal prefix: this file ships with both the
+    tarball and the /usr packages."""
+    found = shutil.which("darlingserver")
+    return Path(found) if found else Path("/usr/bin/darlingserver")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "build/darling-src/build/src/external/darlingserver/darlingserver")
-    parser.add_argument("--destination", type=Path, default=Path("/usr/local/bin/darlingserver"))
+    parser.add_argument("--destination", type=Path, default=default_server_destination())
     parser.add_argument("--backups", type=Path, default=ROOT / "build/backups/darlingserver")
     args = parser.parse_args()
     try:
