@@ -36,6 +36,12 @@ if [ ! -f packaging/common/stage.sh ] || [ ! -d packaging/testdata ]; then
   exit 2
 fi
 
+# T1_GATES_BREAK=<name> breaks the object under test on purpose so the negative control at the
+# bottom can prove the swept rows (G-STATIC-5b's two, and the stage.sh rc row) really go red. It
+# mutates the OBJECT, not an expectation: render-fail / hash-leak / stage-fail. Unset in a normal
+# run, and never inherited into the control's child run (the control skips itself when it is set).
+BREAK=${T1_GATES_BREAK:-}
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/darling-t1-gates.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 
@@ -43,6 +49,14 @@ for stale in "${TMPDIR:-/tmp}/render-eq" "${TMPDIR:-/tmp}/plan-bookworm.verbatim
   [ -e "$stale" ] || continue
   printf "note: %s is present. The pre-8eb6bbe harness would have READ this leftover; this one ignores it (MAJOR-1). Not deleting it (NIT-2): it is not this harness's file, and the evidence should stay visible.\n" "$stale"
 done
+
+# Scratch copies and git tags -- never do this. A `cp -a` of a WORKTREE keeps its `.git` *pointer*,
+# so the copy shares the original repo's refs and object store: `git -C <copy> tag -d v0.1.0`
+# deletes the tag from the SHARED repo, not from a private copy. That is exactly how a PR-1 review
+# repro wiped this repo's `v0.1.0` (recovered with `git fetch --tags`; the remote always had it).
+# Scratch copies MUST be made with `git clone` or `git worktree add`, and a destructive git command
+# must never run inside one. To reproduce a tagless box (the F4/F11 case) clone WITHOUT tags:
+#     git clone --no-tags <repo> /tmp/tagless && (cd /tmp/tagless && bash packaging/testdata/run-gates.sh)
 
 pass=0; fail=0
 ok()   { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
@@ -81,7 +95,27 @@ chk "describe suffix 0.1.0-3-gabc1234 -> 0.1.0" "$(printf '%s\n' "$out" | awk -F
 ./packaging/common/pkg-version.sh not-a-tag >/dev/null 2>"$WORK/verr"; chk "garbage fails loudly" "$?" 1
 chk "garbage names the input" "$(grep -c "not-a-tag" "$WORK/verr")" 1
 chk "garbage emits NO 0.0.0" "$(grep -c '0\.0\.0' "$WORK/verr")" 0
-chk "a bare hash -> the dev form" "$(./packaging/common/pkg-version.sh 2d75d58 | cut -d. -f1-2)" "0.0"
+
+# F11 (authorised follow-up): classify()'s first arm used to admit only a DIGIT-initial string, so a
+# bare hash whose first byte is a letter (a-f -- 6 of the 16 hex digits, ~37.5% of commits) fell to
+# the `*)` FATAL while the file's own comment says the discriminator is the DOT. Pin the
+# letter-initial case (the regression), the digit-initial case that already worked, the 4-hex-char
+# floor, and the non-hex 4+ char case that must STAY fatal.
+pkgv() { ./packaging/common/pkg-version.sh "$1" 2>/dev/null; }
+chk "F11: a digit-initial bare hash -> the dev form" "$(pkgv 2d75d58 | cut -d. -f1-2)" "0.0"
+chk "F11: a letter-initial bare hash -> the dev form" "$(pkgv deadbeef | cut -d. -f1-2)" "0.0"
+chk "F11: another letter-initial hash (a1ae47e) -> the dev form" "$(pkgv a1ae47e | cut -d. -f1-2)" "0.0"
+chk "F11: 4 hex characters are enough (abcd)" "$(pkgv abcd | cut -d. -f1-2)" "0.0"
+chk "F11: the dev release is date-stamped (0.devYYYYMMDD)" \
+  "$(./packaging/common/pkg-version.sh --deb deadbeef | grep -c '^0\.0\.0+lol-0\.dev[0-9][0-9]*$')" 1
+./packaging/common/pkg-version.sh abcg >/dev/null 2>&1; chk "F11: a non-hex 4+ char string STAYS fatal" "$?" 1
+# F11 control: the pin above must track the object, not the harness. Revert the arm in a copy and
+# the same letter-initial input goes back to FATAL -- so a re-weakening really does turn it red.
+sed 's/\[0-9a-f\]\*) : ;;/[0-9]*) : ;;/' packaging/common/pkg-version.sh > "$WORK/pkgv-f11.sh"
+chk "F11 control: the reverted copy differs (mutation is real)" \
+  "$(cmp -s packaging/common/pkg-version.sh "$WORK/pkgv-f11.sh" && echo same || echo differs)" "differs"
+mrc=0; sh "$WORK/pkgv-f11.sh" deadbeef >/dev/null 2>&1 || mrc=$?
+chk "F11 control: with the old arm a letter-initial hash FATALs again" "$mrc" 1
 
 sec "G-STATIC-4/5  render.sh: one list -> three syntaxes, no drift, no tokens"
 # --tag v0.1.0 on every render here, never the ambient `git describe` (MINOR-4, both ways round):
@@ -127,25 +161,56 @@ sec "G-STATIC-5b  render.sh accepts the PLAN's inline-comment style (hermetic --
 # Build the snippet INSIDE the gate: copy the worktree's own packaging/common into the private
 # workdir, give its bookworm list the inline-comment style PLAN 8.1 prints it with, and render
 # *that*. Both sides of the comparison are produced by this run; nothing is read from /tmp.
-# --tag too (see G-STATIC-4/5): both rows grep a pipeline, so a render that FATALled would leave
-# them comparing empty against empty -- green, and vacuous.
+#
+# F4 sweep -- "a gate that passes by not testing" (plan C25). These two rows used to grep a render
+# PIPELINE inline: a render that FATALled left both `sed`s empty, so `diff | wc -l` (=0) and
+# `grep -c '#'` on empty output (=0) BOTH matched the expectation, and a dead section reported
+# green. Each render now writes its control to a FILE first and its exit status is asserted; only
+# then are the two files compared, so a failed render turns its rc row red instead of hiding behind
+# an empty-vs-empty diff. The negative control proves it with T1_GATES_BREAK=render-fail/hash-leak.
 mkdir -p "$WORK/eq"
 cp packaging/common/*.sh packaging/common/*.txt packaging/common/deps.* "$WORK/eq/"
 sed 's/^\([^#].*[^[:space:]]\)[[:space:]]*$/\1    # inline note (PLAN 8.1 style)/' \
   packaging/common/deps.deb.bookworm > "$WORK/eq/deps.deb.bookworm"
 if cmp -s "$WORK/eq/deps.deb.bookworm" packaging/common/deps.deb.bookworm; then no "the inline-comment variant is identical to the delivered file (mutation is vacuous)"; else ok "the inline-comment variant differs from the delivered file"; fi
+
+# render the inline-comment copy to a file; the rc is the row that was missing. hash-leak (a
+# control) injects a '#' into its Depends, render-fail makes the render FATAL before printing.
+eqrc=0
+case "$BREAK" in
+  render-fail) false > "$WORK/eq.inline.ctl" || eqrc=$? ;;
+  hash-leak)   sh "$WORK/eq/render.sh" --family deb --tag v0.1.0 --release bookworm --fixture 2>/dev/null \
+                 | sed 's/^Depends: /Depends: # leaked /' > "$WORK/eq.inline.ctl" || eqrc=$? ;;
+  *)           sh "$WORK/eq/render.sh" --family deb --tag v0.1.0 --release bookworm --fixture \
+                 > "$WORK/eq.inline.ctl" 2>"$WORK/eq.inline.err" || eqrc=$? ;;
+esac
+chk "the inline-comment render exits 0" "$eqrc" 0
+# the delivered render -> its own file too, so the same class cannot reappear on the baseline side.
+drc=0; ./packaging/common/render.sh --family deb --tag v0.1.0 --release bookworm --fixture \
+  > "$WORK/eq.delivered.ctl" 2>"$WORK/eq.delivered.err" || drc=$?
+chk "the delivered render (comparison baseline) exits 0" "$drc" 0
+chk "the inline-comment render has a Depends line" "$(grep -c '^Depends: ' "$WORK/eq.inline.ctl")" 1
+chk "the delivered render has a Depends line" "$(grep -c '^Depends: ' "$WORK/eq.delivered.ctl")" 1
 chk "inline comments are a legal input: same Depends, 0 diff lines" \
-  "$(diff <(sh "$WORK/eq/render.sh" --family deb --tag v0.1.0 --release bookworm --fixture | sed -n 's/^Depends: //p') \
-          <(./packaging/common/render.sh --family deb --tag v0.1.0 --release bookworm --fixture | sed -n 's/^Depends: //p') | wc -l)" 0
+  "$(diff <(sed -n 's/^Depends: //p' "$WORK/eq.inline.ctl") <(sed -n 's/^Depends: //p' "$WORK/eq.delivered.ctl") | wc -l)" 0
 chk "no '#' leaks into the rendered Depends" \
-  "$(sh "$WORK/eq/render.sh" --family deb --tag v0.1.0 --release bookworm --fixture | sed -n 's/^Depends: //p' | grep -c '#' || true)" 0
+  "$(sed -n 's/^Depends: //p' "$WORK/eq.inline.ctl" | grep -c '#' || true)" 0
 
 sec "G-STATIC-6  stage.sh over the hostile-shape fixture"
-rm -rf "$WORK/fix" && bash packaging/testdata/mkfixture.sh "$WORK/fix" >/dev/null && sh packaging/common/stage.sh "$WORK/fix/root" "$WORK/fix/out" >"$WORK/stage.log"
+rm -rf "$WORK/fix" && bash packaging/testdata/mkfixture.sh "$WORK/fix" >/dev/null
+# stage.sh's exit status, asserted (belt and braces): the guard loop below already red-flags a
+# missing artifact, but the two diff rows further down ("runtime + launcher == all", the C18
+# comm) compare two *products* and would read 0 on an empty-vs-empty stage failure. With the rc row
+# they cannot pass by not testing; T1_GATES_BREAK=stage-fail is its control.
+st_rc=0
+if [ "$BREAK" = stage-fail ]; then st_rc=1; else sh packaging/common/stage.sh "$WORK/fix/root" "$WORK/fix/out" >"$WORK/stage.log" || st_rc=$?; fi
+chk "stage.sh over the hostile-shape fixture exits 0" "$st_rc" 0
+missing=0
 for a in files.all files.quoted files.emptydirs files.launcher files.runtime count.runtime count.launcher installed-size-kib; do
-  [ -s "$WORK/fix/out/$a" ] || no "artifact missing/empty: $a"
+  [ -s "$WORK/fix/out/$a" ] || { no "artifact missing/empty: $a"; missing=1; }
 done
-ok "all 8 artifacts present and non-empty"
+# conditional: this used to be an unconditional `ok`, i.e. a green row that could never go red.
+[ "$missing" = 0 ] && ok "all 8 artifacts present and non-empty"
 chk "files.runtime == expect-runtime (independent computation)" \
   "$(diff <(sort "$WORK/fix/out/files.runtime") <(sort "$WORK/fix/expect-runtime") | wc -l)" 0
 chk "runtime + launcher == all" \
@@ -277,6 +342,24 @@ PY
   chk "deps.* + conflicts.txt == the PLAN source lists" "$(grep -c 'IDENTICAL' "$WORK/deps.log")" 5
 else
   skip "no T1_PLAN_FILE: the PLAN-pin check (the PLAN is not in this repo)"
+fi
+
+# --- negative control (F4 sweep) ---------------------------------------------------------------
+# Each swept row must be able to go RED. The control breaks the OBJECT under test (T1_GATES_BREAK)
+# and re-runs this file, asserting the run exits non-zero AND names the row that was swept. The
+# child sees BREAK set, so it skips this section -- no recursion.
+if [ -z "$BREAK" ]; then
+  sec "negative control: the swept rows MUST go red when their object breaks"
+  esc=$(printf '\033')
+  ctl() { # ctl BREAK LABEL: the child must exit non-zero and FAIL exactly that row
+    crc=0; cout=$(T1_GATES_BREAK="$1" bash "$0" 2>&1) || crc=$?
+    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL $2")
+    if [ "$crc" != 0 ] && [ "$cn" = 1 ]; then ok "T1_GATES_BREAK=$1 -> red on '$2' (rc $crc)"
+    else no "T1_GATES_BREAK=$1: expected exactly 1 'FAIL $2', rc $crc, got $cn"; fi
+  }
+  ctl render-fail "the inline-comment render exits 0"
+  ctl hash-leak   "no '#' leaks into the rendered Depends"
+  ctl stage-fail  "stage.sh over the hostile-shape fixture exits 0"
 fi
 
 sec "SUMMARY"
