@@ -99,8 +99,8 @@ jobs:
           TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::tag '$TAG' must look like v1.2.3: this workflow publishes on 'v*' tags"; exit 1
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '$TAG' must look like v1.2.3 or v1.2.3-rc1: this workflow publishes on 'v*' tags"; exit 1
           fi
           # Fail closed: only "(HTTP 404)" means the tag is free. 401/403/5xx/network errors
           # must stop the run instead of being read as "available".
