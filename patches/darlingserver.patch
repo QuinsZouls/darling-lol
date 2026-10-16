@@ -2336,7 +2336,7 @@ index 9cd7b81..180f372 100644
  			parent->_notifyListeningKqchannels(NOTE_FORK, nsid());
  		}
  	}
-@@ -465,7 +524,75 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
+@@ -465,7 +524,110 @@ DarlingServer::Process::MemoryInfo DarlingServer::Process::memoryInfo() const {
  	return info;
  };
  
@@ -2363,6 +2363,41 @@ index 9cd7b81..180f372 100644
 +// ENOENT when no VMA matches, and -1 when the ioctl is unavailable (callers fall back to the text parser).
 +#include <sys/ioctl.h>
 +#include <linux/fs.h>
++// darling-lol: PROCMAP_QUERY only exists in <linux/fs.h> from Linux 6.11 on, and the build host may
++// ship older kernel headers (the CI runner's Ubuntu has 6.8). Declare the UAPI surface here when the
++// header lacks it; the query stays a runtime probe (a mismatch fails with ENOTTY/EINVAL and the callers
++// fall back to parsing /proc/<pid>/maps), so an old header can never be fatal.
++#ifndef PROCMAP_QUERY
++struct procmap_query {
++	__u64 size;
++	__u64 query_flags;
++	__u64 query_addr;
++	__u64 vma_start;
++	__u64 vma_end;
++	__u64 vma_flags;
++	__u64 vma_page_size;
++	__u64 vma_offset;
++	__u64 inode;
++	__u32 dev_major;
++	__u32 dev_minor;
++	__u32 vma_name_size;
++	__u32 build_id_size;
++	__u64 vma_name_addr;
++	__u64 build_id_addr;
++};
++enum procmap_query_flags {
++	PROCMAP_QUERY_VMA_READABLE = 0x01,
++	PROCMAP_QUERY_VMA_WRITABLE = 0x02,
++	PROCMAP_QUERY_VMA_EXECUTABLE = 0x04,
++	PROCMAP_QUERY_VMA_SHARED = 0x08,
++	PROCMAP_QUERY_COVERING_OR_NEXT_VMA = 0x10,
++	PROCMAP_QUERY_FILE_BACKED_VMA = 0x20,
++};
++/* the encoded number is part of the kernel ABI: 'f' = 0x66, command 17, 104-byte struct */
++#define PROCMAP_QUERY _IOWR('f', 17, struct procmap_query)
++static_assert(sizeof(struct procmap_query) == 104, "procmap_query fallback must match the Linux 6.11 UAPI");
++static_assert(PROCMAP_QUERY == 0xC0686611ul, "the PROCMAP_QUERY ioctl number changed");
++#endif
 +#include <fcntl.h>
 +static std::atomic<bool> procmapQueryUnsupported(false);
 +

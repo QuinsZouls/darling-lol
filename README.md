@@ -21,6 +21,9 @@ Game files, Riot installers, account databases, tokens, local prefixes, captures
 - Git + Git LFS, Bash, curl, unzip, CMake, Make, Clang/LLD, LLVM development files, a C/C++ compiler, Python 3.12+ and the Darling build dependencies. The patch includes LLVM 22/23 branch-opcode compatibility; the new PC used LLVM/Clang 23. Node.js is needed only for the offline JavaScript checks.
 - X11/XCB/SHM development files for the current runtime helpers.
 - Enough free disk for Darling sources/build, Git LFS assets and the game: budget at least 50 GB. Building is substantially larger than this source-only repository.
+- Building needs no 6.11+ kernel headers: the `PROCMAP_QUERY` `/proc/<pid>/maps` fast path declares the UAPI
+  itself when `<linux/fs.h>` predates Linux 6.11. At runtime the code probes the ioctl and falls back to parsing
+  `/proc/<pid>/maps` on kernels that do not support it.
 
 Use the dependency list in the [pinned Darling source](https://github.com/darlinghq/darling/tree/60ba801decee7a00782f74f6be4c8ffb013f79ff) for your distribution. `tools/env-check.sh` provides a starting check; its legacy package names may need adapting to your distro.
 
