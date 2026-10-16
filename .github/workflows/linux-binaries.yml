@@ -222,12 +222,62 @@ jobs:
           INPUT_RUNTIME_OVERRIDES: ${{ github.event.inputs.runtime_overrides }}
         run: |
           set -euo pipefail
+          # The installed tree is tarred right here, immediately after the build and on the
+          # same disk, so the next failure of this step must be diagnosable in one look.
+          df -h /
           mkdir -p dist
           name="darling-lol-linux-x86_64-$(git describe --tags --always)"
 
-          # Base runtime: exactly the tree cmake installed under the prefix.
-          if [ -s build/installed-files.txt ]; then
-            sudo tar -C / -czf "dist/$name-base-runtime.tar.gz" -T build/installed-files.txt
+          # build/installed-files.txt is cmake's *claim* (its `-- Installing:` lines), not a
+          # guarantee: the experimental per-user overrides step above runs the guest, and by
+          # packaging time the prefix is no longer exactly what cmake left behind. Run
+          # 38861026879 died here -- `tar -T` exits 2 on the first stale path
+          # (usr/local/libexec/darling/usr/bin/install-bin) -- the step failed, the artifact
+          # upload was skipped, and a 46-minute build produced nothing.
+          #
+          # So partition the manifest instead: archive what is still there, and say loudly what
+          # is not. One stale path now costs a warning, never the whole artifact set. Counters
+          # and files, not arrays, so an empty manifest cannot trip `set -u`.
+          manifest_total=0
+          manifest_missing=0
+          : > build/present-installed-files.txt
+          : > build/missing-installed-files.txt
+          if [ -f build/installed-files.txt ]; then
+            # `-e` alone would drop a dangling symlink, which tar can still archive as a link.
+            while IFS= read -r path || [ -n "$path" ]; do
+              [ -n "$path" ] || continue
+              manifest_total=$((manifest_total + 1))
+              if [ -e "$path" ] || [ -L "$path" ]; then
+                printf '%s\n' "$path" >> build/present-installed-files.txt
+              else
+                manifest_missing=$((manifest_missing + 1))
+                printf '%s\n' "$path" >> build/missing-installed-files.txt
+              fi
+            done < build/installed-files.txt
+          else
+            # Degenerate case: nothing to partition. Say so and let the fallback below run
+            # instead of tripping `set -e` on the manifest copies further down.
+            echo "::warning::build/installed-files.txt is missing; nothing to partition"
+          fi
+
+          # Say what is missing, with enough shape to tell the two failure modes apart: a path
+          # that is simply gone and a path whose whole neighbourhood is gone mean different
+          # things, and `ls -ld` of the path plus its parent is what distinguishes them.
+          if [ "$manifest_missing" -gt 0 ]; then
+            echo "::warning::$manifest_missing of $manifest_total paths listed by cmake no longer exist; archiving the remaining $((manifest_total - manifest_missing))"
+            head -n 50 build/missing-installed-files.txt
+            while IFS= read -r path; do
+              ls -ld -- "$path" "$(dirname -- "$path")" 2>&1 || true
+            done < <(head -n 5 build/missing-installed-files.txt)
+            cp build/missing-installed-files.txt dist/MISSING-installed-files.txt
+          fi
+
+          # Base runtime: exactly the tree cmake installed under the prefix, minus the paths
+          # that are gone. `--ignore-failed-read` is belt and braces for a file that vanishes
+          # between the partition above and this archive.
+          if [ -s build/present-installed-files.txt ]; then
+            sudo tar -C / -czf "dist/$name-base-runtime.tar.gz" --ignore-failed-read \
+              -T build/present-installed-files.txt
           else
             echo "::warning::empty install manifest; falling back to the default prefix paths"
             sudo tar -C / -czf "dist/$name-base-runtime.tar.gz" --ignore-failed-read \
@@ -250,13 +300,31 @@ jobs:
             echo "commit: $GITHUB_SHA"
             echo "ref: $GITHUB_REF_NAME"
             echo "components: $(python3 -c "import json;print(len(json.load(open('upstream/manifest.json'))['components']))")"
+            echo "install-manifest: $manifest_total files, $manifest_missing missing"
             echo "inputs: build=$INPUT_BUILD runtime_overrides=$INPUT_RUNTIME_OVERRIDES"
             echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "uname: $(uname -a)"
           } > dist/BUILD-INFO.txt
           cp build/install.log dist/
-          cp build/installed-files.txt dist/
+          if [ -f build/installed-files.txt ]; then
+            cp build/installed-files.txt dist/
+          else
+            # Fail-soft only for the manifest copy: everything else in dist/ is still worth
+            # shipping, and the warning above already says what is wrong.
+            echo "::warning::no build/installed-files.txt to archive; dist/installed-files.txt is omitted"
+          fi
+
+          # A step that "succeeds" while shipping nothing is exactly how the 46-minute build
+          # produced zero artifacts: fail here instead, while the log still explains why. The
+          # two expected names come first so a *missing* tarball is caught too -- the glob
+          # alone would happily pass on the one that is left.
+          for artifact in \
+            "dist/$name-base-runtime.tar.gz" \
+            "dist/$name-runtime-artifacts.tar.gz" \
+            dist/*.tar.gz; do
+            [ -s "$artifact" ] || { echo "::error::empty artifact $artifact"; exit 1; }
+          done
 
           ls -la dist
           du -sh dist/*
