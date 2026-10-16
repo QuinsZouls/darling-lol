@@ -10,12 +10,13 @@ failed exactly that way, in process.cpp).
 
 This script extracts the guarded block from the patch, wraps it in a harness that
 keeps the fallback enabled (no <linux/fs.h>) and compiles it with -Werror, so the
-asserts it carries -- sizeof == 104, ioctl number 0xC0686611 and the six
-PROCMAP_QUERY_* flag values -- all have to hold. Where the host headers do define
-the UAPI it also compares the kernel's own ioctl number and struct size with the
-ones we ship, turning "dead code on the dev box" into a drift check; the flag
-values are pinned by the fallback harness instead, because the host check cannot
-compare them without weakening the pre-6.11 skip detection.
+asserts it carries -- sizeof == 104, ioctl number 0xC0686611, the six
+PROCMAP_QUERY_* flag values and the offset of each of the fifteen struct members
+-- all have to hold. Where the host headers do define the UAPI it also compares
+the kernel's own ioctl number and struct size with the ones we ship, turning
+"dead code on the dev box" into a drift check; the flag values are pinned by the
+fallback harness instead, because the host check cannot compare them without
+weakening the pre-6.11 skip detection.
 
 Usage: python3 scripts/check-procmap-shim.py [patches/darlingserver.patch]
 """
@@ -45,6 +46,20 @@ FLAGS = (
 )
 FLAG_ASSERTS = ''.join(f'static_assert({name} == {value}, "{name} changed");\n'
                        for name, value in FLAGS)
+
+# A swapped pair of members keeps sizeof, the ioctl number and the flags identical, so the
+# only way to notice is to pin where each field lives: the kernel writes the real layout and
+# our copy reads it back, so a swap silently crosses the data instead of failing.
+FIELDS = (
+    ('size', 0), ('query_flags', 8), ('query_addr', 16),
+    ('vma_start', 24), ('vma_end', 32), ('vma_flags', 40),
+    ('vma_page_size', 48), ('vma_offset', 56), ('inode', 64),
+    ('dev_major', 72), ('dev_minor', 76), ('vma_name_size', 80),
+    ('build_id_size', 84), ('vma_name_addr', 88), ('build_id_addr', 96),
+)
+FIELD_ASSERTS = ''.join(
+    f'static_assert(offsetof(struct procmap_query, {name}) == {offset}, "{name} moved");\n'
+    for name, offset in FIELDS)
 
 # Compiler diagnostics that mean "these headers simply do not have the Linux 6.11
 # UAPI" rather than "the code we ship is broken". g++ and clang++ both quote the
@@ -118,7 +133,8 @@ def check_fallback(compiler, block):
     """Compile the extracted block with the fallback enabled (no <linux/fs.h>)."""
     source = ('#include <sys/ioctl.h>      /* _IOWR */\n'
               '#include <linux/types.h>    /* __u64 / __u32 */\n'
-              + block + FLAG_ASSERTS + 'int main() { return 0; }\n')
+              '#include <cstddef>            /* offsetof */\n'
+              + block + FLAG_ASSERTS + FIELD_ASSERTS + 'int main() { return 0; }\n')
     ok, output = compile_source(compiler, source)
     if output:
         print(output)

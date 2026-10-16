@@ -46,6 +46,21 @@ def write_patch(directory, text):
     return path
 
 
+def swap_member_names(text, first, second):
+    """Swap the two `__u64 <name>;` struct member declarations of `text`.
+
+    A renamed member keeps sizeof, the ioctl number and every flag value identical,
+    so only the offset asserts notice it. The placeholder step keeps the two
+    sequential substitutions from collapsing into a single name.
+    """
+    swapped = (text
+               .replace(f'__u64 {first};', '__u64 vma_swap_placeholder;')
+               .replace(f'__u64 {second};', f'__u64 {first};')
+               .replace('__u64 vma_swap_placeholder;', f'__u64 {second};'))
+    assert swapped != text, 'the swap mutation must change the patch text'
+    return swapped
+
+
 def patch_without_block_end():
     """The real patch, minus the `+#endif` that closes the fallback guard."""
     lines = PATCH.read_text().splitlines(keepends=True)
@@ -119,7 +134,24 @@ class FallbackHarnessTests(unittest.TestCase):
         for name, value in check_procmap_shim.FLAGS:
             self.assertIn(f'static_assert({name} == {value}', source)
         self.assertEqual(len(check_procmap_shim.FLAGS), 6)
-        self.assertEqual(source.count('static_assert('), 6)
+        # Counted by name: the harness also carries the field-offset asserts, so
+        # `source.count('static_assert(')` is no longer six.
+        self.assertEqual(source.count('static_assert(PROCMAP_QUERY_'), 6)
+
+    def test_field_offsets_are_pinned(self):
+        # N2: swapping two members keeps sizeof, the ioctl number and every flag value
+        # identical, so only an offset assert can see it -- and a swap is worse than a
+        # size mismatch, because the kernel fills the real layout while our copy reads
+        # it back, crossing the data instead of failing.
+        source = self.captured_source()
+        self.assertIn(
+            'static_assert(offsetof(struct procmap_query, vma_start) == 24', source)
+        for name, offset in check_procmap_shim.FIELDS:
+            self.assertIn(f'static_assert(offsetof(struct procmap_query, {name}) == {offset},',
+                          source)
+        self.assertEqual(len(check_procmap_shim.FIELDS), 15)
+        self.assertEqual(source.count('static_assert(offsetof('), 15)
+        self.assertIn('#include <cstddef>', source)  # offsetof lives there
 
 
 class HostUapiTests(unittest.TestCase):
@@ -173,6 +205,18 @@ class EndToEndTests(unittest.TestCase):
         mutated_patch = PATCH.read_text().replace('PROCMAP_QUERY_FILE_BACKED_VMA = 0x20,',
                                                  'PROCMAP_QUERY_FILE_BACKED_VMA = 0x40,')
         self.assertNotEqual(mutated_patch, PATCH.read_text())  # the mutation must bite
+        with tempfile.TemporaryDirectory() as directory:
+            status, output = self.run_main(write_patch(directory, mutated_patch))
+        self.assertEqual(status, 1, output)
+        self.assertIn('FAIL: the PROCMAP_QUERY fallback does not compile', output)
+
+    def test_swapped_members_fail_the_check(self):
+        # N2: swapping the two names keeps the size, the ioctl number and every flag
+        # value identical, so the checker used to pass and the kernel then filled the
+        # real layout while our copy read it back -- silently crossed data, not EINVAL.
+        mutated_patch = swap_member_names(PATCH.read_text(), 'vma_start', 'vma_end')
+        # The two member declarations really traded places (each line is a `+` line).
+        self.assertIn('__u64 vma_end;\n+\t__u64 vma_start;', mutated_patch)
         with tempfile.TemporaryDirectory() as directory:
             status, output = self.run_main(write_patch(directory, mutated_patch))
         self.assertEqual(status, 1, output)
