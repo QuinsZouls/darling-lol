@@ -9,7 +9,9 @@
 # nothing the harness did not write (T1 review MAJOR-1: the pre-review battery compared a rendered
 # Depends against a *leftover* /tmp/render-eq it neither created nor shipped, and planted its
 # snippet at /tmp/re/render-eq -- a typo -- so a clean box scored 48/49). The two stale leftovers
-# are removed on entry so a run below cannot fall back to them.
+# of that generation are REPORTED, never removed (NIT-2): they are not this harness's files to
+# delete, and the warning keeps the regression visible instead of silently cleaning up after it.
+# This battery does not read them either way.
 #
 # The dependency lists are additionally compared against the PLAN's own fenced lists when
 # T1_PLAN_FILE points at PLAN.md; the PLAN is not in this repo, so the check is skipped otherwise:
@@ -17,7 +19,16 @@
 #     T1_PLAN_FILE=/path/to/PLAN.md bash packaging/testdata/run-gates.sh
 #
 # Companions: packaging/testdata/run-mutations.sh (the two mutation tables, self-asserting, with a
-# negative control) and packaging/testdata/state-probe.sh (the transient current-state probe).
+# negative control), packaging/testdata/run-build-log-gates.sh (the install-log invariants of
+# scripts/build-packaging.sh, solved as 9 asserted cases) and packaging/testdata/state-probe.sh
+# (the transient current-state probe).
+#
+# `sh run-gates.sh` (= dash here) parses this file up to the first process substitution and dies
+# there -- AFTER printing ~20 PASS lines, which a careless runner reads as "mostly green" (review
+# INFO-3). Refuse up front instead, in a form dash can parse, so that the message is the output.
+case "${BASH_VERSION:-}" in
+  "") echo "run-gates: run me with bash: bash $0" >&2; exit 2 ;;
+esac
 set -u
 
 if [ ! -f packaging/common/stage.sh ] || [ ! -d packaging/testdata ]; then
@@ -30,8 +41,7 @@ trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 
 for stale in "${TMPDIR:-/tmp}/render-eq" "${TMPDIR:-/tmp}/plan-bookworm.verbatim"; do
   [ -e "$stale" ] || continue
-  printf 'note: dropping the pre-review leftover %s (MAJOR-1)\n' "$stale"
-  rm -rf -- "$stale"
+  printf "note: %s is present. The pre-8eb6bbe harness would have READ this leftover; this one ignores it (MAJOR-1). Not deleting it (NIT-2): it is not this harness's file, and the evidence should stay visible.\n" "$stale"
 done
 
 pass=0; fail=0
@@ -74,8 +84,16 @@ chk "garbage emits NO 0.0.0" "$(grep -c '0\.0\.0' "$WORK/verr")" 0
 chk "a bare hash -> the dev form" "$(./packaging/common/pkg-version.sh 2d75d58 | cut -d. -f1-2)" "0.0"
 
 sec "G-STATIC-4/5  render.sh: one list -> three syntaxes, no drift, no tokens"
+# --tag v0.1.0 on every render here, never the ambient `git describe` (MINOR-4, both ways round):
+# in a tagless checkout (`git archive`, a `fetch-depth: 1` actions/checkout) the ambient "tag" is the
+# commit hash, and render.sh then derives a date-stamped dev version -- which made the dpkg-deb row
+# below fail on a CORRECT tree (53/1, with a confounding message) and made this whole section a
+# function of WHICH commit is checked out: pkg-version.sh's hash path accepts a bare hash only when
+# its first character is a digit, so on any commit whose short hash starts a..f every render here
+# FATALled (11 red rows; F11 in the report). Explicit tags make the section version-independent and
+# deterministic -- the version itself is asserted on purpose just below and in G-STATIC-3.
 for fam in deb rpm arch; do
-  ./packaging/common/render.sh --family "$fam" --fixture > "$WORK/$fam.out" || no "render $fam"
+  ./packaging/common/render.sh --family "$fam" --tag v0.1.0 --fixture > "$WORK/$fam.out" || no "render $fam"
 done
 if ! grep -qE '@[A-Za-z_]+@' "$WORK/deb.out" "$WORK/rpm.out" "$WORK/arch.out" && \
    ! grep -qF '${binary:Version}' "$WORK/deb.out" "$WORK/rpm.out" "$WORK/arch.out"; then ok "no @TOKEN@ / \${binary:Version} left"; else no "token left"; fi
@@ -93,6 +111,8 @@ chk "arch: depend == deps.arch" \
   "$(diff <(sed -n 's/^depend = //p' "$WORK/arch.out" | sort -u) <(grep -v '^#' packaging/common/deps.arch | sed 's/[[:space:]]*$//' | grep -v '^$' | sort -u) | wc -l)" 0
 chk "arch: pkgver contains a dash (libalpm)" "$(grep -c '^pkgver = [^-]*-' "$WORK/arch.out")" 1
 if command -v dpkg-deb >/dev/null 2>&1; then
+  # deb.out is the --tag v0.1.0 render above, so this row is hermetic AND end to end: the version
+  # dpkg-deb reads back comes from the tag, through render.sh, through pkg-version.sh.
   mkdir -p "$WORK/ctl/DEBIAN"; cp "$WORK/deb.out" "$WORK/ctl/DEBIAN/control"
   if dpkg-deb -b "$WORK/ctl" "$WORK/t1.deb" 2>/dev/null; then
     chk "dpkg-deb accepts the rendered control file" "$(dpkg-deb -f "$WORK/t1.deb" Version)" "0.1.0+lol-1"
@@ -107,16 +127,18 @@ sec "G-STATIC-5b  render.sh accepts the PLAN's inline-comment style (hermetic --
 # Build the snippet INSIDE the gate: copy the worktree's own packaging/common into the private
 # workdir, give its bookworm list the inline-comment style PLAN 8.1 prints it with, and render
 # *that*. Both sides of the comparison are produced by this run; nothing is read from /tmp.
+# --tag too (see G-STATIC-4/5): both rows grep a pipeline, so a render that FATALled would leave
+# them comparing empty against empty -- green, and vacuous.
 mkdir -p "$WORK/eq"
 cp packaging/common/*.sh packaging/common/*.txt packaging/common/deps.* "$WORK/eq/"
 sed 's/^\([^#].*[^[:space:]]\)[[:space:]]*$/\1    # inline note (PLAN 8.1 style)/' \
   packaging/common/deps.deb.bookworm > "$WORK/eq/deps.deb.bookworm"
 if cmp -s "$WORK/eq/deps.deb.bookworm" packaging/common/deps.deb.bookworm; then no "the inline-comment variant is identical to the delivered file (mutation is vacuous)"; else ok "the inline-comment variant differs from the delivered file"; fi
 chk "inline comments are a legal input: same Depends, 0 diff lines" \
-  "$(diff <(sh "$WORK/eq/render.sh" --family deb --release bookworm --fixture | sed -n 's/^Depends: //p') \
-          <(./packaging/common/render.sh --family deb --release bookworm --fixture | sed -n 's/^Depends: //p') | wc -l)" 0
+  "$(diff <(sh "$WORK/eq/render.sh" --family deb --tag v0.1.0 --release bookworm --fixture | sed -n 's/^Depends: //p') \
+          <(./packaging/common/render.sh --family deb --tag v0.1.0 --release bookworm --fixture | sed -n 's/^Depends: //p') | wc -l)" 0
 chk "no '#' leaks into the rendered Depends" \
-  "$(sh "$WORK/eq/render.sh" --family deb --release bookworm --fixture | sed -n 's/^Depends: //p' | grep -c '#' || true)" 0
+  "$(sh "$WORK/eq/render.sh" --family deb --tag v0.1.0 --release bookworm --fixture | sed -n 's/^Depends: //p' | grep -c '#' || true)" 0
 
 sec "G-STATIC-6  stage.sh over the hostile-shape fixture"
 rm -rf "$WORK/fix" && bash packaging/testdata/mkfixture.sh "$WORK/fix" >/dev/null && sh packaging/common/stage.sh "$WORK/fix/root" "$WORK/fix/out" >"$WORK/stage.log"
@@ -167,6 +189,18 @@ if [ "$prc" = 0 ] && grep -qE 'documented state OK|T8-LANDED' "$WORK/probe.log";
 else
   no "probe is in an undocumented state (rc=$prc)"
 fi
+
+sec "G-PKG-2  scripts/build-packaging.sh: the three install-log invariants (MINOR-1/2/3, pinned)"
+# The rig that asserted these once lived only in the T2 coder's artifacts; run-gates.sh now runs it
+# here, so a later edit that re-weakens an invariant turns this battery red (review F10). The child
+# extracts check_install_log() from the delivered script by text and asserts 9 cases + a control.
+lrc=0; lout=$(sh packaging/testdata/run-build-log-gates.sh 2>&1) || lrc=$?
+printf '%s\n' "$lout" | sed 's/^/    /'
+chk "the log-invariant harness exits 0" "$lrc" 0
+chk "its whole table ran (9 cases + 4 control rows)" \
+  "$(printf '%s\n' "$lout" | sed -n 's/^  total:   \([0-9][0-9]*\) passed, [0-9][0-9]* failed$/\1/p')" 13
+chk "and no row of it failed" \
+  "$(printf '%s\n' "$lout" | sed -n 's/^  total:   [0-9][0-9]* passed, \([0-9][0-9]*\) failed$/\1/p')" 0
 
 sec "acceptance: C19 / step ordering / no hard-coded version"
 chk "check-prefix.sh is called from step 3b (after files.all)" \

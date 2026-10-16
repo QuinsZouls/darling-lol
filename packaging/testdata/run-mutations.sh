@@ -18,6 +18,13 @@
 #   row  the 5 G-STATIC-6 mutations of TASKS.md T1
 #
 # Nothing is written outside a private `mktemp -d` workdir.
+#
+# `sh run-mutations.sh` (= dash here) parses this file up to the first process substitution and dies
+# there -- AFTER printing a partial table, which a careless runner reads as "mostly green" (review
+# INFO-3). Refuse up front instead, in a form dash can parse, so the message is the output.
+case "${BASH_VERSION:-}" in
+  "") echo "run-mutations: run me with bash: bash $0" >&2; exit 2 ;;
+esac
 set -u
 
 if [ ! -f packaging/common/stage.sh ]; then

@@ -4,7 +4,12 @@
 # It is no longer a "current-state probe": the literal default it used to document HAS been removed
 # from tools/install-riot-darling-server.py, and this guard's job is to keep it from coming back --
 # it covers the window until T8 stages the launcher tree, after which G-PREFIX-1 sweeps the real
-# tree and T8 may delete this file.
+# tree and this file may be deleted.
+#
+# ⚠ Not on its own: run-gates.sh invokes this probe and asserts the message it prints (`:163` in the
+# reviewed tree, `:179` after the fix commit), so deleting this file turns the battery red (review
+# MINOR-5). T8 may therefore delete it ONLY together with that invocation and the header line that
+# names it (`:23`), in the SAME change -- or keep it, which is the cheaper option.
 #
 # Why it still exists (unchanged): the positive G-PREFIX-1 fixture (mkprefixfixture.sh `prefix_host`)
 # deliberately writes the **T8-FIXED** installer: no literal prefix, resolved with shutil.which().

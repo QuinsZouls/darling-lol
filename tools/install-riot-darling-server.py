@@ -84,8 +84,9 @@ def install(source, destination, backups):
 
 
 def default_server_destination():
-    """The packaged server's path. Never a literal prefix: this file ships with both the
-    tarball and the /usr packages."""
+    """The packaged server's path. No prefix literal is baked in: this file ships with both the
+    tarball and the /usr packages, so a darlingserver that is really installed is found through
+    PATH by shutil.which(); the fallback is where the packages put it, a bare path, not a prefix."""
     found = shutil.which("darlingserver")
     return Path(found) if found else Path("/usr/bin/darlingserver")
 
