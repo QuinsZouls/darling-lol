@@ -63,6 +63,13 @@ jobs:
       - name: Validate the source package
         run: python3 scripts/validate.py
 
+      - name: Compile the PROCMAP_QUERY fallback (pre-6.11 kernel headers)
+        # The fallback is only compiled when the kernel headers predate Linux 6.11 -- the case on
+        # this runner, but not on a modern dev box -- so binaries built here are the only place a
+        # typo would show up. Compiling it in this fast job turns a many-hour feedback loop into
+        # seconds.
+        run: python3 scripts/check-procmap-shim.py
+
       - name: Run the unit tests
         # Requires Python >= 3.12: the tests subclass pathlib.Path with
         # `*parts, **kwargs`, which Python 3.11's object.__init__ rejects.
