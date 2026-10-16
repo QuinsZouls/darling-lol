@@ -1,0 +1,28 @@
+# packaging/common/deps.arch -- runtime depends for Arch Linux.
+# One entry per line; render.sh emits one "depend = <entry>" line each (PLAN §8.3).
+# ffmpeg is an optdepend (Arch ships an ffmpeg6 compat package), same R4 reasoning as §8.2.
+glibc
+gcc-libs
+libgl
+libegl
+glu
+vulkan-icd-loader
+fuse2
+libx11
+libxext
+libxcursor
+libxrandr
+libxkbfile
+cairo
+fontconfig
+freetype
+libpng
+libjpeg-turbo
+giflib
+libtiff
+libpulse
+dbus
+systemd-libs
+libcrypt
+xdg-utils
+python

@@ -83,10 +83,18 @@ def install(source, destination, backups):
     }
 
 
+def default_server_destination():
+    """The packaged server's path. No prefix literal is baked in: this file ships with both the
+    tarball and the /usr packages, so a darlingserver that is really installed is found through
+    PATH by shutil.which(); the fallback is where the packages put it, a bare path, not a prefix."""
+    found = shutil.which("darlingserver")
+    return Path(found) if found else Path("/usr/bin/darlingserver")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "build/darling-src/build/src/external/darlingserver/darlingserver")
-    parser.add_argument("--destination", type=Path, default=Path("/usr/local/bin/darlingserver"))
+    parser.add_argument("--destination", type=Path, default=default_server_destination())
     parser.add_argument("--backups", type=Path, default=ROOT / "build/backups/darlingserver")
     args = parser.parse_args()
     try:
