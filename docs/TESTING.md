@@ -82,7 +82,7 @@ Useful probes (build tokenized Python helpers from `build/runtime/tools/`):
 - `riot-event-coalescing-check`: preserve key events and latest mouse motion.
 - `m327-cgl-resolver-check`: first calls through dynamically looked-up GL functions retain floating-point arguments; expected `first_sampler_linear=1 first_color_arguments=1 errors=0,0`. Build with `build-m58f327-opengl.py` and run with `run-riot-native-check.py m327-cgl-resolver-check`.
 - `m327-cgl-direct-check`: with `RCLOL_GPU_DIRECT_OTHER_WINDOW_TEST=1` and an owned 337x339 native target, interleave 338x339 fallback surfaces; expected `active_presenter_preserved=1 fallback_frames=357`. This needs the native presentation fixture; it is not a `run-riot-native-check.py` choice.
-- `riot-metal-presentation-check`: Vulkan clear reaches the GL texture, including late window/context attachment.
+- `riot-metal-presentation-check`: Vulkan clear reaches the GL texture, including late window/context attachment. Set `RIOT_PRESENTATION_NESTED=1` to place the Metal layer beneath two ordinary layers and verify that its drawables are still presented and recycled past the three-drawable pool limit.
 - `riot-metal-concurrency-check`: submission ordering, resource lifetime and concurrent recording.
 
 `RIOT_PRESENTATION_STRESS=1` makes the presentation probe run 120 frames. With the game and clients closed, force async encoding for this standalone probe using the guest flag `/tmp/metal-async-encode`, then remove it. The tested old path leaked 120 synchronization FDs over 120 frames; the fixed path leaked zero. Inspect the probe's host `/proc/PID/fd` for `anon_inode:syncobj_file` if reproducing that test.
@@ -394,3 +394,21 @@ Observe host CPU/thread scheduling, GPU counters, temperatures and memory pressu
 Compare similar scene, ability and camera activity with the same power settings (and correct charger on a laptop). Do not report a paused, dead, unfocused or empty scene as a fight benchmark. If an allowed host measurement supplies frame times, report p99 in milliseconds; its reciprocal is percentile-equivalent FPS, not the mean of the slowest 1% of frames. Manual FPS readings alone do not establish p99 frame times.
 
 The CPU symbolizer offers `--leaf-only` because the host DWARF unwinder can drop guest Mach-O stacks. Successfully unwound samples alone are not a representative profile. Local API lockfiles, account data and raw logs must stay outside version control.
+
+## CFHost cancellation regression
+
+After configuring and building CFNetwork, build and run the isolated probe:
+
+```sh
+python3 build/runtime/tools/build-riot-cfhost-cancel-check.py
+python3 build/runtime/tools/run-riot-native-check.py riot-cfhost-cancel-check
+```
+
+Run against the installed CFNetwork override. Expect
+`CFHOST_CANCEL_CHECK cancel callback lifetime repeated pass=1`. The unpatched
+library traps in `CFRetain(NULL)`; the runner requires the exact success line because
+Darling can return status zero even when the guest traps. The probe uses localhost
+and exercises 100 cancellations with both retained and early-released caller
+references, without launching or inspecting Riot. A failure prints
+`CFHOST_CANCEL_CHECK fail stage=...`; `unexpected-callback` means a completed
+lookup arrived instead of the cancellation.

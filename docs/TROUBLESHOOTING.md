@@ -56,6 +56,20 @@ The installer fetcher no longer treats a missing archive `Info.plist` or the inf
 
 There is also a separate known compatibility gap: native LaunchAgent watch registration can return HTTP 409 after the League install path is accepted, leaving the download idle. A historical inspector hook handles this and interrupted `pending_verify` states in 28 mock cases, but that hook is disabled in normal launches and excluded from the manual workflow. There is no verified runtime-only replacement for that handoff in this snapshot. Do not assume the native permission and launcher fixes resolve every idle Install case, or enable debugger/API automation to work around it.
 
+## Riot closes after a network lookup is cancelled
+
+Two local crashes were traced to `CFNetwork::_HostCancel` calling `CFRetain(NULL)`.
+`CFHostCancelInfoResolution` scheduled its cancellation callback with an empty
+context, so processing that source triggered `SIGTRAP` in CoreFoundation and
+terminated RiotClientServices. The UI helpers then exited as a consequence.
+
+The CFNetwork patch supplies the host and retains it until the cancellation source
+is invalidated. The standalone `riot-cfhost-cancel-check` reproduces the old trap
+and passes 100 cancellations with the fix, including releasing the caller's host
+reference before callback delivery. This establishes the cancellation fix; a long
+Riot session still needs confirmation. With both clients and the game closed,
+run `./scripts/update.sh` to install it, then `sh scripts/run.sh`.
+
 ## UI crashes after a button opens an external link
 
 LaunchServices dereferenced a nullable error-output pointer in six paths. The patch checks the pointer itself and populates supplied outputs; the standalone regression covers missing handlers and null outputs. Electron opens LaunchServices through an absolute CoreServices subframework path, so the paired installer also replaces that binary in the stopped guest prefix. Updating only `RuntimeFrameworks/LaunchServices.framework` can leave the crash unfixed.
@@ -198,15 +212,25 @@ Resources only the GPU uses (`private`, `memoryless`, and drawables, including L
 The first import of a drawable into the presenting OpenGL context, and the first semaphore import, are logged too; later ones only when they fail (at most five):
 
 ```
-[MetalDevice] pid=… drawable GL import (first) dedicated=yes size=… 1920x1080 memoryType=1 tiling=linear glTiling=linear dedicated_error=0x0 import_error=0x0 setup_error=0x0 storage_error=0x0 query_error=0x0 ok
+[MetalDevice] pid=… drawable GL import (first) dedicated=yes size=… 1920x1080 memoryType=1 vkTiling=linear glTiling=linear dedicated_error=0x0 import_error=0x0 setup_error=0x0 storage_error=0x0 query_error=0x0 ok
 [MetalDevice] pid=… drawable GL semaphore (first) import_error=0x0 wait_error=0x0 ok (checked for the first 600 imports)
 ```
 
-A non-zero error or `FAILED` means the frames cannot reach the window. Before 2026-10-16 the import did not mark the memory as dedicated, which the extension requires; Mesa ignores it, and it is the suspected cause of the NVIDIA black screen (not yet confirmed). If the game shows a black screen on NVIDIA, report it with this file.
+A non-zero error or `FAILED` means the frames cannot reach the window. Before 2026-10-16 the import did not mark the memory as dedicated, which the extension requires; Mesa ignores it, and it is the suspected cause of the NVIDIA black screen (not yet confirmed). An NVIDIA log of 2026-10-16 showed `glTiling=optimal` with `setup_error=0x501 storage_error=0x501 FAILED`: NVIDIA's GL rejects `GL_LINEAR_TILING_EXT`, so the linear Vulkan image could not be imported. Since then the internal image and the GL texture use optimal tiling when `GL_VENDOR` contains NVIDIA (`vkTiling=optimal glTiling=optimal ok` is the expected line); everything else keeps linear. If the game shows a black screen on NVIDIA, report it with this file.
+
+An additional NVIDIA report on `68f816d` showed successful optimal-tiling import but repeated `Metal Device timed out giving us a Drawable to present` messages. Its [presentation trace](https://github.com/lucannez64/darling-lol/issues/3#issuecomment-6214732591) shows all three drawables queued and all three main-thread presentation callbacks running, followed by timeouts with three frames still queued. The compositor only prepared a Metal layer when it was the root layer, skipping nested Metal layers. It now prepares Metal layers throughout the tree. A standalone nested-layer reproduction exhausts the pool before this correction and passes ten presentations with pixel readback after it; the root-layer probe also passes. Confirmation on the reporter's NVIDIA system is still needed.
 
 ### Host-side checks
 
 These are host settings, not game settings. Run on AC power, and use a performance power profile (`powerprofilesctl set performance`, or `asusctl profile -P Performance` on ASUS laptops). On the tested desktop the game is limited mostly by its own main thread on the CPU, not by the GPU (see [status](STATUS.md#game-fps-2026-10-1314)), so laptop CPU power limits matter as much as the GPU choice.
+
+## Mouse latency despite good FPS
+
+[Issue #10](https://github.com/lucannez64/darling-lol/issues/10) reports mouse latency with FPS comparable to Windows. FPS alone does not measure input-to-display latency, and the report does not yet identify which stage adds the delay.
+
+The X11 backend previously called `XSync` after every cursor-shape update, waiting for an X server reply on the input thread. It now uses `XFlush` to send the change immediately without waiting. This removes an avoidable round trip during cursor updates. A local manual retest on 2026-10-16 found that the mouse problem no longer occurred with VSync enabled. Input-to-display latency has not been measured, and confirmation from the original reporter is still pending. Rebuild and install with `./scripts/update.sh` after exiting the game and both clients.
+
+For a manual comparison, keep the scene, FPS cap, display refresh and compositor settings the same. Record whether the delay affects the cursor itself, camera movement, or actions after clicking, and compare the in-game VSync setting on and off. Include the desktop/compositor, X11 or Xwayland session, GPU/driver, monitor refresh and fullscreen/windowed mode in the report. Do not automate game input. The fullscreen cursor-shape problem below is a separate known symptom.
 
 ## Cursor stops changing shape in fullscreen
 

@@ -9,6 +9,7 @@ import tempfile
 
 root = Path(__file__).resolve().parent.parent
 checks = {
+    "riot-cfhost-cancel-check": "CFHOST_CANCEL_CHECK",
     "riot-launchservices-null-error-check": "LAUNCHSERVICES_NULL_ERROR",
     "m327-cgl-resolver-check": "GL_RESOLVER",
     "riot-mach-exception-state-check": "MACH_EXCEPTION_STATE",
@@ -86,6 +87,9 @@ with tempfile.TemporaryFile() as output:
             print(line)
             if (args.check == "riot-running-application-check" and
                     line != "RUNNING_APP found=1 activated=1 missing=1"):
+                result = 1
+            if (args.check == "riot-cfhost-cancel-check" and
+                    line != "CFHOST_CANCEL_CHECK cancel callback lifetime repeated pass=1"):
                 result = 1
             if (args.check == "riot-mach-exception-state-check" and
                     line != "MACH_EXCEPTION_STATE state=1 identity=1 handled=2 server=1"):
