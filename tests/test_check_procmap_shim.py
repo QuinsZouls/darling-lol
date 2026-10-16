@@ -96,6 +96,32 @@ class ExtractFallbackTests(unittest.TestCase):
         self.assertIn('no added', str(caught.exception))
 
 
+class FallbackHarnessTests(unittest.TestCase):
+    def captured_source(self):
+        """Run check_fallback against a fake compiler and return the source it got."""
+        captured = {}
+
+        def fake_compile(compiler, source):
+            captured['source'] = source
+            return True, ''
+
+        with mock.patch.object(check_procmap_shim, 'compile_source', side_effect=fake_compile):
+            with contextlib.redirect_stdout(io.StringIO()):
+                passed = check_procmap_shim.check_fallback('g++', '// block\n')
+        self.assertTrue(passed)
+        return captured['source']
+
+    def test_flag_values_are_pinned(self):
+        # The ioctl number is derived from the struct size, so a mutated flag value
+        # is invisible to both the number and the size: only these asserts see it.
+        source = self.captured_source()
+        self.assertIn('static_assert(PROCMAP_QUERY_FILE_BACKED_VMA == 0x20', source)
+        for name, value in check_procmap_shim.FLAGS:
+            self.assertIn(f'static_assert({name} == {value}', source)
+        self.assertEqual(len(check_procmap_shim.FLAGS), 6)
+        self.assertEqual(source.count('static_assert('), 6)
+
+
 class HostUapiTests(unittest.TestCase):
     def check_with(self, output):
         """Run check_host_uapi against a fake compiler result, output captured."""
@@ -135,6 +161,17 @@ class EndToEndTests(unittest.TestCase):
 
     def test_wrong_struct_size_fails_the_check(self):
         mutated_patch = PATCH.read_text().replace(SIZE_ASSERT, SIZE_ASSERT.replace('104', '100'))
+        self.assertNotEqual(mutated_patch, PATCH.read_text())  # the mutation must bite
+        with tempfile.TemporaryDirectory() as directory:
+            status, output = self.run_main(write_patch(directory, mutated_patch))
+        self.assertEqual(status, 1, output)
+        self.assertIn('FAIL: the PROCMAP_QUERY fallback does not compile', output)
+
+    def test_mutated_flag_value_fails_the_check(self):
+        # N2: the ioctl number only encodes the struct size, so a mutated flag used to
+        # compile and the check used to exit 0. The flag asserts are what catches it.
+        mutated_patch = PATCH.read_text().replace('PROCMAP_QUERY_FILE_BACKED_VMA = 0x20,',
+                                                 'PROCMAP_QUERY_FILE_BACKED_VMA = 0x40,')
         self.assertNotEqual(mutated_patch, PATCH.read_text())  # the mutation must bite
         with tempfile.TemporaryDirectory() as directory:
             status, output = self.run_main(write_patch(directory, mutated_patch))

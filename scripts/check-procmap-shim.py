@@ -10,10 +10,12 @@ failed exactly that way, in process.cpp).
 
 This script extracts the guarded block from the patch, wraps it in a harness that
 keeps the fallback enabled (no <linux/fs.h>) and compiles it with -Werror, so the
-two static_asserts it carries -- sizeof == 104 and ioctl number 0xC0686611 -- have
-to hold. Where the host headers do define the UAPI it also asserts that the
-kernel's own definition matches the one we ship, turning "dead code on the dev
-box" into a drift check.
+asserts it carries -- sizeof == 104, ioctl number 0xC0686611 and the six
+PROCMAP_QUERY_* flag values -- all have to hold. Where the host headers do define
+the UAPI it also compares the kernel's own ioctl number and struct size with the
+ones we ship, turning "dead code on the dev box" into a drift check; the flag
+values are pinned by the fallback harness instead, because the host check cannot
+compare them without weakening the pre-6.11 skip detection.
 
 Usage: python3 scripts/check-procmap-shim.py [patches/darlingserver.patch]
 """
@@ -30,6 +32,19 @@ FALLBACK_START = '#ifndef PROCMAP_QUERY'
 CXXFLAGS = ('-std=c++17', '-Wall', '-Wextra', '-Werror')
 IOCTL_NUMBER = '0xC0686611ul'
 STRUCT_SIZE = 104
+
+# The encoded ioctl number only depends on the struct *size*, so neither it nor
+# sizeof() would notice a mutated flag: pin every constant the kernel is handed.
+FLAGS = (
+    ('PROCMAP_QUERY_VMA_READABLE', '0x01'),
+    ('PROCMAP_QUERY_VMA_WRITABLE', '0x02'),
+    ('PROCMAP_QUERY_VMA_EXECUTABLE', '0x04'),
+    ('PROCMAP_QUERY_VMA_SHARED', '0x08'),
+    ('PROCMAP_QUERY_COVERING_OR_NEXT_VMA', '0x10'),
+    ('PROCMAP_QUERY_FILE_BACKED_VMA', '0x20'),
+)
+FLAG_ASSERTS = ''.join(f'static_assert({name} == {value}, "{name} changed");\n'
+                       for name, value in FLAGS)
 
 # Compiler diagnostics that mean "these headers simply do not have the Linux 6.11
 # UAPI" rather than "the code we ship is broken". g++ and clang++ both quote the
@@ -103,7 +118,7 @@ def check_fallback(compiler, block):
     """Compile the extracted block with the fallback enabled (no <linux/fs.h>)."""
     source = ('#include <sys/ioctl.h>      /* _IOWR */\n'
               '#include <linux/types.h>    /* __u64 / __u32 */\n'
-              + block + 'int main() { return 0; }\n')
+              + block + FLAG_ASSERTS + 'int main() { return 0; }\n')
     ok, output = compile_source(compiler, source)
     if output:
         print(output)
@@ -115,7 +130,12 @@ def check_fallback(compiler, block):
 
 
 def check_host_uapi(compiler):
-    """Assert that a >= 6.11 host header agrees with the fallback, or skip it."""
+    """Compare the host's ioctl number and struct size with ours, or skip it.
+
+    The flag values are not compared here: on a pre-6.11 host the identifiers are
+    simply absent and a reference to them would turn the expected "skip" into a
+    hard failure. The fallback harness pins them instead.
+    """
     source = ('#include <linux/fs.h>\n'
               f'static_assert(PROCMAP_QUERY == {IOCTL_NUMBER}, "host ioctl number differs from the fallback");\n'
               f'static_assert(sizeof(struct procmap_query) == {STRUCT_SIZE}, "host struct size differs from the fallback");\n'
