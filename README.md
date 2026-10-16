@@ -82,6 +82,19 @@ sh scripts/run.sh
 
 For updating single components, [incremental update instructions](docs/SETUP.md#updating-an-existing-runtime) explain the server and memory installers, user-owned backups and the full Darling restart needed to activate replacements. Perform activation only after manually exiting the game and both clients.
 
+## Prebuilt Linux binaries
+
+CI only builds on demand and only ever publishes through tags. Press **Run workflow** on the
+[Linux binaries](actions/workflows/linux-binaries.yml) workflow (branch `main`) to build the
+runtime; the resulting tarballs are attached to the run as the `darling-lol-linux-binaries`
+artifact (kept 90 days by default). Nothing is built automatically on pushes or pull requests.
+
+To cut a release either pass the version as the workflow's `tag` input (`v0.1.0`), which builds and
+then creates that tag and the release in one run, or create the tag in GitHub afterwards: the tag
+run promotes the newest successful build of the same commit, so no second build is needed. A tag
+whose commit was never built fails with a message saying so. Release assets are the runtime
+tarballs plus `BUILD-INFO.txt` and the install logs.
+
 ## Layout
 
 ```
