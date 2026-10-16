@@ -47,12 +47,17 @@ done
 [ -n "$tags" ] || tags=" $(git describe --tags --always 2>/dev/null || echo 0.0.0)"
 
 # classify TAG -- print "<ver> <rel>" on success, return 1 for a string that is neither a version
-# tag nor a commit hash. A git-describe suffix is stripped; a version must carry at least one dot
-# (a bare hash does not), so `2d75d58` is a commit and `0.1.0` is a version.
+# tag nor a commit hash. A git-describe suffix is stripped; the discriminator is *the dot*, not the
+# first character (a version must carry at least one dot, a bare hash does not), so `2d75d58` is a
+# commit and `0.1.0` is a version. The first arm admits a HEX-initial string, not only a
+# digit-initial one: a bare hash whose first byte is a letter is 6 of the 16 hex digits, ~37.5% of
+# commits, and used to fall through to the `*)` FATAL, breaking every tagless derivation. `[0-9a-f]`
+# (not `[0-9A-Fa-f]`) is deliberate: git abbreviates in lowercase, so an uppercase byte is a typo
+# and the non-hex reject below is the right verdict for it.
 classify() {
   _tag=$1
   case "$_tag" in
-    v[0-9]* | [0-9]*) : ;;
+    v[0-9]* | [0-9a-f]*) : ;;
     *) return 1 ;;
   esac
   _base=${_tag#v}
