@@ -183,13 +183,18 @@ fi
 # A gate that fails the build it exists to protect is the defect class C23 warns about, so this
 # function asserts the invariants the literal text was after. Every one of them is false for the
 # published /usr/local artefact we must not ship:
-#   (1) every path the log names must live inside the staging tree. A path outside it means cmake
-#       installed somewhere else -- a reused /usr/local tree is exactly that shape.
-#   (2) no named path may be a HOST /usr/local path. The guest's libexec/darling/usr/local is not
-#       one; a CMAKE_INSTALL_PREFIX=/usr/local build, or a stale such tree, always is.
-#   (3) an Up-to-date line naming a FILE this run never installed means the tree was not fresh.
-#       Directories are exempt (both causes above) and duplicate install rules are covered by
-#       construction. With step 3 refusing a non-empty root this can only fire on a real regression.
+#   (1) every path the log names must live inside the staging tree: a PREFIX test, not a substring
+#       one. A path outside it means cmake installed somewhere else -- a reused /usr/local tree is
+#       exactly that shape.
+#   (2) no named path may sit at the host prefix, i.e. start with "$pkg_root/usr/local/". The
+#       guest's payload lives at "$pkg_root/usr/libexec/darling/usr/local", never there, so this is
+#       an exact prefix test and needs no mask; a CMAKE_INSTALL_PREFIX=/usr/local build, or a stale
+#       such tree, always has a path under it.
+#   (3) an Up-to-date line the LOG cannot explain means the tree was not fresh. The log explains it
+#       two ways and only two: the same path was also installed by a duplicate rule, or some path
+#       installed in this run lies deeper under it (the implicit-parent cause). Whether the path
+#       exists on this host is not evidence. With step 3 refusing a non-empty root this can only
+#       fire on a real regression.
 # 🚨 R6: darling-file_cmds:70-71 installs `install-bin` and then renames it to `install` with an
 # install(CODE) block whose WORKING_DIRECTORY is `${CMAKE_INSTALL_PREFIX}/libexec/darling/usr/bin`
 # -- DESTDIR is ignored by that code path, so with prefix /usr it renames into the *host* /usr (a
@@ -205,23 +210,31 @@ check_install_log() {
 	claims=$(grep -aE '^-- (Installing|Up-to-date): ' "$log" | sed -E 's/^-- (Installing|Up-to-date): //' || true)
 	[ -n "$claims" ] || fatal "$log has no '-- Installing:' lines: the install did not run"
 
-	# (1) everything cmake names must be inside the staging tree.
-	stray=$(printf '%s\n' "$claims" | grep -vF -e "$pkg_root/" || true)
+	# (1) everything cmake names must be inside the staging tree. A PREFIX test, not a substring
+	# one: `grep -vF -e "$pkg_root/"` matches the root string anywhere in the line, so a claim
+	# outside the tree that merely *contains* it (/opt$pkg_root/usr/bin/darling) passed. `index()`
+	# is literal, so a $pkg_root carrying regex metacharacters (`.`, `+`, `[`) needs no escaping.
+	stray=$(printf '%s\n' "$claims" | PKG_ROOT_SLASH="$pkg_root/" awk 'index($0, ENVIRON["PKG_ROOT_SLASH"]) != 1' || true)
 	if [ -n "$stray" ]; then
 		echo "build-packaging: FATAL the install log names paths outside $pkg_root:" >&2
 		printf '%s\n' "$stray" | head -10 >&2
 		fatal "DESTDIR staging failed: cmake installed outside the staging tree"
 	fi
 
-	# (2) no host /usr/local. Strip the guest skeleton first: it is payload, not a prefix.
-	residue=$(printf '%s\n' "$claims" | sed 's#.*/libexec/darling/usr/local#@guest-local@#' | grep -F '/usr/local' || true)
+	# (2) no host-prefix /usr/local path in the tree. A literal PREFIX test too, and it needs no
+	# mask: the guest skeleton is payload at "$pkg_root/usr/libexec/darling/usr/local", never at
+	# "$pkg_root/usr/local". The old `sed 's#.*/libexec/darling/usr/local#...#'` was greedy and
+	# unanchored -- it stripped everything up to the LAST match -- so a genuine /usr/local path
+	# that also contained the guest substring ($pkg_root/usr/local/x/libexec/darling/usr/local/y)
+	# was masked out of the sweep.
+	residue=$(printf '%s\n' "$claims" | PKG_LOCAL_SLASH="$pkg_root/usr/local/" awk 'index($0, ENVIRON["PKG_LOCAL_SLASH"]) == 1' || true)
 	if [ -n "$residue" ]; then
 		echo "build-packaging: FATAL the install log names host /usr/local paths:" >&2
 		printf '%s\n' "$residue" | head -10 >&2
 		fatal "this is not a /usr staging tree: a stale /usr/local tree was reused, or the prefix was not /usr"
 	fi
 
-	# (3) Up-to-date: report the shape, fail only on the unexplained-file case.
+	# (3) Up-to-date: report the shape, and fail unless the LOG explains the line.
 	tmp=$(mktemp -d)
 	trap 'rm -rf -- "$tmp"' EXIT INT TERM HUP
 	# `|| true`: an empty match set is not an error, and with `pipefail` on (bash) grep's status
@@ -230,15 +243,27 @@ check_install_log() {
 	grep -a '^-- Installing: ' "$log" | sed 's/^-- Installing: //' | LC_ALL=C sort -u > "$tmp/installed" || true
 	LC_ALL=C comm -12 "$tmp/up_to_date" "$tmp/installed" > "$tmp/explained"
 	LC_ALL=C comm -23 "$tmp/up_to_date" "$tmp/installed" > "$tmp/unexplained"
-	: > "$tmp/unexplained_files"
-	while IFS= read -r p; do
-		[ -n "$p" ] || continue
-		[ -d "$p" ] || printf '%s\n' "$p" >> "$tmp/unexplained_files"
-	done < "$tmp/unexplained"
+	# An unexplained path is an implicit parent only when the log itself installs something deeper
+	# under it. The previous form asked `[ -d "$p" ]` -- i.e. THIS host's filesystem -- so the same
+	# log scored rc=0 or rc=1 depending on whether a path happened to exist, and a log replayed
+	# against another tree misreported the cause. Consequence, deliberate: a stale DIRECTORY that
+	# this run then installs into is still exempt (it is genuinely undetectable from the log
+	# alone); a stale directory nothing was installed under is not. `FILENAME`, not `NR == FNR`:
+	# with an empty $tmp/installed every line of the second file would take the first branch.
+	INSTALLED_LOG="$tmp/installed" awk '
+		FILENAME == ENVIRON["INSTALLED_LOG"] {
+			# every ancestor of an installed path, literal ("/a/b/c" adds "/a" and "/a/b");
+			# split() keeps the leading empty field of an absolute path, so f[1] is "".
+			n = split($0, f, "/"); acc = f[1]
+			for (j = 2; j < n; j++) { acc = acc "/" f[j]; parents[acc] = 1 }
+			next
+		}
+		!( $0 in parents )
+	' "$tmp/installed" "$tmp/unexplained" > "$tmp/unexplained_files"
 	if [ -s "$tmp/unexplained_files" ]; then
-		echo "build-packaging: FATAL the install log reports Up-to-date for files this run never installed:" >&2
+		echo "build-packaging: FATAL the install log reports Up-to-date for paths this run never installed:" >&2
 		head -10 "$tmp/unexplained_files" >&2
-		fatal "the staging tree was not fresh: cmake reused files that were already there"
+		fatal "the staging tree was not fresh: cmake reused paths that were already there"
 	fi
 	note "install log: $(wc -l < "$tmp/installed") paths installed, $(wc -l < "$tmp/up_to_date") Up-to-date ($(wc -l < "$tmp/explained") of them covered by a duplicate install rule, $(wc -l < "$tmp/unexplained") implicit parent directories)"
 }
