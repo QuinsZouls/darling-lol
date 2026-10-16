@@ -2448,7 +2448,7 @@ index 9cd7b81..180f372 100644
  
  DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInfo(uintptr_t address) const {
  	if (isDead()) {
-@@ -473,31 +600,55 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
+@@ -473,31 +635,55 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
  	}
  
  	MemoryRegionInfo info;
@@ -2511,7 +2511,7 @@ index 9cd7b81..180f372 100644
  
  		info.protection = 0;
  
-@@ -657,27 +808,38 @@ void DarlingServer::Process::syncMemory(uintptr_t address, size_t size, int sync
+@@ -657,27 +843,38 @@ void DarlingServer::Process::syncMemory(uintptr_t address, size_t size, int sync
  	return thread->syncMemory(address, size, sync_flags);
  };
  
