@@ -21,6 +21,9 @@ Game files, Riot installers, account databases, tokens, local prefixes, captures
 - Git + Git LFS, Bash, curl, unzip, CMake, Make, Clang/LLD, LLVM development files, a C/C++ compiler, Python 3.12+ and the Darling build dependencies. The patch includes LLVM 22/23 branch-opcode compatibility; the new PC used LLVM/Clang 23. Node.js is needed only for the offline JavaScript checks.
 - X11/XCB/SHM development files for the current runtime helpers.
 - Enough free disk for Darling sources/build, Git LFS assets and the game: budget at least 50 GB. Building is substantially larger than this source-only repository.
+- Building needs no 6.11+ kernel headers: the `PROCMAP_QUERY` `/proc/<pid>/maps` fast path declares the UAPI
+  itself when `<linux/fs.h>` predates Linux 6.11. At runtime the code probes the ioctl and falls back to parsing
+  `/proc/<pid>/maps` on kernels that do not support it.
 
 Use the dependency list in the [pinned Darling source](https://github.com/darlinghq/darling/tree/60ba801decee7a00782f74f6be4c8ffb013f79ff) for your distribution. `tools/env-check.sh` provides a starting check; its legacy package names may need adapting to your distro.
 
@@ -78,6 +81,19 @@ sh scripts/run.sh
 `update.sh` re-applies the patches that changed (reverting the earlier version of each, so other edits in the source tree survive), rebuilds incrementally, and reinstalls the base runtime and the per-user overrides. It refuses to run while a Riot or League process is open.
 
 For updating single components, [incremental update instructions](docs/SETUP.md#updating-an-existing-runtime) explain the server and memory installers, user-owned backups and the full Darling restart needed to activate replacements. Perform activation only after manually exiting the game and both clients.
+
+## Prebuilt Linux binaries
+
+CI only builds on demand and only ever publishes through tags. Press **Run workflow** on the
+[Linux binaries](actions/workflows/linux-binaries.yml) workflow (branch `main`) to build the
+runtime; the resulting tarballs are attached to the run as the `darling-lol-linux-binaries`
+artifact (kept 90 days by default). Nothing is built automatically on pushes or pull requests.
+
+To cut a release either pass the version as the workflow's `tag` input (`v0.1.0`), which builds and
+then creates that tag and the release in one run, or create the tag in GitHub afterwards: the tag
+run promotes the newest successful build of the same commit, so no second build is needed. A tag
+whose commit was never built fails with a message saying so. Release assets are the runtime
+tarballs plus `BUILD-INFO.txt` and the install logs.
 
 ## Layout
 

@@ -1,0 +1,431 @@
+name: Linux binaries
+
+# Builds the pinned + patched Darling runtime for x86-64 and publishes the resulting
+# binaries as workflow artifacts, and as GitHub Release assets on `v*` tags.
+#
+# The heavy build NEVER starts on its own: only `workflow_dispatch` runs it, so a
+# release is a deliberate decision. Two ways to cut one:
+#   * `workflow_dispatch` with `tag: v0.1.0` — builds once, then creates that tag at
+#     the built commit and the release with those binaries (all in one run; if the
+#     build fails no tag is created).
+#   * create the `v0.1.0` tag in GitHub after a manual build of the same commit — the
+#     `publish-release` job then promotes that build's artifacts unchanged (minutes,
+#     no rebuild, and the released files are exactly the ones that were validated).
+#
+# Binaries are NEVER committed to the repository: scripts/validate.py rejects any
+# tracked file that looks binary (ELF/MZ/Mach-O magic, NUL bytes, non-UTF8, or the
+# .so/.dylib/.zip/... suffixes), so the only delivery channels are
+# `actions/upload-artifact` and `gh release create`.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'Build the full pinned Darling runtime (slow)'
+        type: boolean
+        default: true
+      runtime_overrides:
+        description: 'Also build the experimental per-user runtime overrides'
+        type: boolean
+        default: true
+      tag:
+        description: 'Release tag to create from this build (e.g. v0.1.0). Empty = build only, no release.'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Cheap gate, runs on every push/PR. `scripts/validate.py` is the repository's real
+  # source-package gate; the unit tests must also stay green.
+  source-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Validate the source package
+        run: python3 scripts/validate.py
+
+      - name: Compile the PROCMAP_QUERY fallback (pre-6.11 kernel headers)
+        # The fallback is only compiled when the kernel headers predate Linux 6.11 -- the case on
+        # this runner, but not on a modern dev box -- so binaries built here are the only place a
+        # typo would show up. Compiling it in this fast job turns a many-hour feedback loop into
+        # seconds.
+        run: python3 scripts/check-procmap-shim.py
+
+      - name: Run the unit tests
+        # Requires Python >= 3.12: the tests subclass pathlib.Path with
+        # `*parts, **kwargs`, which Python 3.11's object.__init__ rejects.
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+  # Heavy build, manual only: nothing here runs without a human pressing "Run workflow".
+  # A full pinned build takes 1-6 h, so it must never be triggered by a push or a PR.
+  linux-binaries:
+    needs: source-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    # `contents: write` only so a `tag` input can create the tag and the release; the
+    # artifacts themselves are attached even on a plain build.
+    permissions:
+      contents: write
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.build == 'true'
+    steps:
+      # Cheap pre-flight, before the hours-long build: a bad or already-used release tag
+      # must fail in seconds, not after the build.
+      - name: Validate the release tag
+        if: github.event.inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Passed through the environment and never interpolated into the script: the input
+          # is free text and `${{ ... }}` inside `run:` would be evaluated as shell code.
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '$TAG' must look like v1.2.3 or v1.2.3-rc1: this workflow publishes on 'v*' tags"; exit 1
+          fi
+          # A tag the regex accepts can still be an invalid git ref (trailing dot, `..`):
+          # the tag creation would then fail at the very end of the build, which is the class
+          # this pre-flight exists to catch. `git check-ref-format` is authoritative.
+          if ! git check-ref-format "refs/tags/$TAG"; then
+            echo "::error::tag '$TAG' is not a valid git ref name"; exit 1
+          fi
+          # Fail closed: only "(HTTP 404)" means the tag is free. 401/403/5xx/network errors
+          # must stop the run instead of being read as "available".
+          if probe=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>&1); then
+            echo "::error::tag '$TAG' already exists; choose the next version"; exit 1
+          fi
+          case "$probe" in
+            *'(HTTP 404)'*) : ;;
+            *) echo "::error::could not confirm that tag '$TAG' is free: $probe"; exit 1 ;;
+          esac
+          echo "OK: $TAG does not exist yet and will be created at $GITHUB_SHA if the build succeeds."
+
+      # fetch-depth: 0 so `git describe --tags` can name the artifact from the tags.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Must run BEFORE setup-python: $AGENT_TOOLSDIRECTORY is where setup-python
+      # installs the pinned interpreter, so deleting it afterwards would silently
+      # fall back to the (possibly older) system Python and break the tests.
+      - name: Free disk space
+        shell: bash
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+          du -sh .
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install the base toolchain
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git git-lfs cmake make clang lld build-essential pkg-config bison flex \
+            xz-utils unzip curl ca-certificates python3-venv xvfb
+          git lfs install --skip-repo
+
+      - name: Configure the checkout
+        run: |
+          python3 scripts/configure.py --guest-user runner
+          python3 -m venv build/venv
+          build/venv/bin/pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Fetch the pinned Darling sources and apply the patches
+        # Clones darlinghq/darling at the pinned revision, initializes submodules/LFS
+        # and applies all 29 patches. Prints progress; may take a while. build.sh
+        # runs prepare.py again later, which is a no-op on a prepared tree: this
+        # explicit step exists so the pinned debian/control is available to the
+        # dependency step below and so a clone/patch failure is reported on its own.
+        run: python3 scripts/prepare.py
+
+      - name: Install the pinned build dependencies
+        shell: bash
+        run: |
+          sudo apt-get install -y --no-install-recommends devscripts equivs debhelper
+          # The fork has no debian/ directory of its own: the pinned upstream control
+          # file only exists once prepare.py has cloned build/darling-src.
+          if ! sudo mk-build-deps --install --remove \
+               --tool 'apt-get --no-install-recommends -y' \
+               build/darling-src/debian/control; then
+            echo "::warning::mk-build-deps failed; falling back to an explicit apt dependency list"
+            sudo apt-get install -y --no-install-recommends \
+              cmake clang lld bison flex pkg-config libfuse-dev libudev-dev \
+              libcairo2-dev libgl1-mesa-dev libtiff-dev libfreetype-dev libelf-dev \
+              libxml2-dev libegl1-mesa-dev libglu1-mesa-dev libfontconfig1-dev \
+              libbsd-dev libxrandr-dev libxcursor-dev libgif-dev libavcodec-dev \
+              libavformat-dev libswresample-dev libavutil-dev libpulse-dev \
+              libdbus-1-dev libxkbfile-dev libcap-dev libcap2-bin llvm-dev \
+              libvulkan-dev libx11-dev libxext-dev libx11-xcb-dev libxcb-shm0-dev
+          fi
+
+      - name: Build the runtime
+        run: ./scripts/build.sh
+
+      - name: Install the runtime and record the manifest
+        shell: bash
+        run: |
+          set -o pipefail
+          # `sudo tee` merges cmake's stderr into the log; pipefail keeps cmake's
+          # exit status authoritative instead of tee's.
+          sudo cmake --install build/darling-src/build 2>&1 | sudo tee build/install.log > /dev/null
+          # Exact list of everything cmake installed, straight from the log.
+          ( grep -a '^-- Installing: ' build/install.log || true ) \
+            | sed 's|^-- Installing: ||' | sort -u > build/installed-files.txt
+          wc -l build/installed-files.txt
+
+      - name: Build the per-user runtime overrides (experimental)
+        # Experimental: scripts/install-runtime.sh needs a working `darling shell`
+        # prefix/namespace, which may not function in a headless CI runner. It must
+        # never invalidate the base runtime artifact, hence continue-on-error.
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.runtime_overrides == 'true'
+        continue-on-error: true
+        timeout-minutes: 60
+        run: xvfb-run -a ./scripts/install-runtime.sh || ./scripts/install-runtime.sh
+
+      - name: Package the Linux binaries
+        shell: bash
+        env:
+          # Recorded in BUILD-INFO.txt: two builds of the same commit can differ by which
+          # steps ran, and a promoted release artifact must state its variant.
+          INPUT_BUILD: ${{ github.event.inputs.build }}
+          INPUT_RUNTIME_OVERRIDES: ${{ github.event.inputs.runtime_overrides }}
+        run: |
+          set -euo pipefail
+          # The installed tree is tarred right here, immediately after the build and on the
+          # same disk, so the next failure of this step must be diagnosable in one look.
+          df -h /
+          mkdir -p dist
+          name="darling-lol-linux-x86_64-$(git describe --tags --always)"
+
+          # build/installed-files.txt is cmake's *claim* (its `-- Installing:` lines), not a
+          # guarantee: the experimental per-user overrides step above runs the guest, and by
+          # packaging time the prefix is no longer exactly what cmake left behind. Run
+          # 38861026879 died here -- `tar -T` exits 2 on the first stale path
+          # (usr/local/libexec/darling/usr/bin/install-bin) -- the step failed, the artifact
+          # upload was skipped, and a 46-minute build produced nothing.
+          #
+          # So partition the manifest instead: archive what is still there, and say loudly what
+          # is not. One stale path now costs a warning, never the whole artifact set. Counters
+          # and files, not arrays, so an empty manifest cannot trip `set -u`.
+          manifest_total=0
+          manifest_missing=0
+          : > build/present-installed-files.txt
+          : > build/missing-installed-files.txt
+          if [ -f build/installed-files.txt ]; then
+            # `-e` alone would drop a dangling symlink, which tar can still archive as a link.
+            while IFS= read -r path || [ -n "$path" ]; do
+              [ -n "$path" ] || continue
+              manifest_total=$((manifest_total + 1))
+              if [ -e "$path" ] || [ -L "$path" ]; then
+                printf '%s\n' "$path" >> build/present-installed-files.txt
+              else
+                manifest_missing=$((manifest_missing + 1))
+                printf '%s\n' "$path" >> build/missing-installed-files.txt
+              fi
+            done < build/installed-files.txt
+          else
+            # Degenerate case: nothing to partition. Say so and let the fallback below run
+            # instead of tripping `set -e` on the manifest copies further down.
+            echo "::warning::build/installed-files.txt is missing; nothing to partition"
+          fi
+
+          # Say what is missing, with enough shape to tell the two failure modes apart: a path
+          # that is simply gone and a path whose whole neighbourhood is gone mean different
+          # things, and `ls -ld` of the path plus its parent is what distinguishes them.
+          if [ "$manifest_missing" -gt 0 ]; then
+            echo "::warning::$manifest_missing of $manifest_total paths listed by cmake no longer exist; archiving the remaining $((manifest_total - manifest_missing))"
+            head -n 50 build/missing-installed-files.txt
+            while IFS= read -r path; do
+              ls -ld -- "$path" "$(dirname -- "$path")" 2>&1 || true
+            done < <(head -n 5 build/missing-installed-files.txt)
+            cp build/missing-installed-files.txt dist/MISSING-installed-files.txt
+          fi
+
+          # Base runtime: exactly the tree cmake installed under the prefix, minus the paths
+          # that are gone. `--ignore-failed-read` is belt and braces for a file that vanishes
+          # between the partition above and this archive.
+          if [ -s build/present-installed-files.txt ]; then
+            sudo tar -C / -czf "dist/$name-base-runtime.tar.gz" --ignore-failed-read \
+              -T build/present-installed-files.txt
+          else
+            echo "::warning::empty install manifest; falling back to the default prefix paths"
+            sudo tar -C / -czf "dist/$name-base-runtime.tar.gz" --ignore-failed-read \
+              usr/local/libexec/darling usr/local/bin/darlingserver
+          fi
+
+          # Runtime artifacts: the small top-level files in build/ (install logs,
+          # lists, config.json) plus build/runtime (the rendered per-user tools).
+          # We deliberately avoid recursing into the multi-GB build tree, so
+          # build/darling-src and build/venv are never packaged.
+          find build -maxdepth 1 -type f -print > build/runtime-artifact-files.txt
+          echo build/runtime >> build/runtime-artifact-files.txt
+          tar -C . -czf "dist/$name-runtime-artifacts.tar.gz" \
+            --exclude='build/darling-src' --exclude='build/venv' \
+            -T build/runtime-artifact-files.txt
+
+          # Build metadata.
+          {
+            echo "repo: $GITHUB_REPOSITORY"
+            echo "commit: $GITHUB_SHA"
+            echo "ref: $GITHUB_REF_NAME"
+            echo "components: $(python3 -c "import json;print(len(json.load(open('upstream/manifest.json'))['components']))")"
+            echo "install-manifest: $manifest_total files, $manifest_missing missing"
+            echo "inputs: build=$INPUT_BUILD runtime_overrides=$INPUT_RUNTIME_OVERRIDES"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "uname: $(uname -a)"
+          } > dist/BUILD-INFO.txt
+          cp build/install.log dist/
+          if [ -f build/installed-files.txt ]; then
+            cp build/installed-files.txt dist/
+          else
+            # Fail-soft only for the manifest copy: everything else in dist/ is still worth
+            # shipping, and the warning above already says what is wrong.
+            echo "::warning::no build/installed-files.txt to archive; dist/installed-files.txt is omitted"
+          fi
+
+          # A step that "succeeds" while shipping nothing is exactly how the 46-minute build
+          # produced zero artifacts: fail here instead, while the log still explains why. The
+          # two expected names come first so a *missing* tarball is caught too -- the glob
+          # alone would happily pass on the one that is left.
+          for artifact in \
+            "dist/$name-base-runtime.tar.gz" \
+            "dist/$name-runtime-artifacts.tar.gz" \
+            dist/*.tar.gz; do
+            [ -s "$artifact" ] || { echo "::error::empty artifact $artifact"; exit 1; }
+          done
+
+          ls -la dist
+          du -sh dist/*
+
+      - name: Upload the artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: darling-lol-linux-binaries
+          path: dist/
+          if-no-files-found: error
+
+      - name: Create the tag and publish the release
+        # Only when the manual run asked for a tag: `gh release create --target` creates
+        # the tag at the commit that was just built, so the tag can never point at
+        # something that failed to build.
+        if: github.event.inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Linux x86-64 binaries for $TAG, built from $GITHUB_SHA by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+
+  # Tagging is the release trigger. This job does NOT rebuild: it promotes the artifacts of
+  # the newest successful manual build of this exact commit, so a release takes minutes and
+  # always ships the binaries that were actually validated by a full build.
+  publish-release:
+    needs: source-checks
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # create the release and attach the assets
+      actions: read     # list runs and download the artifacts of one of them
+    steps:
+      - name: Find the newest successful manual build of this commit
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow linux-binaries.yml \
+            --commit "$GITHUB_SHA" \
+            --event workflow_dispatch \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+          if [ -z "$run_id" ]; then
+            echo "::error::no successful 'Linux binaries' build (workflow_dispatch) exists for commit $GITHUB_SHA. Run that workflow on this commit first, then re-run this job."
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Promoting the artifacts of run $run_id."
+
+      - name: Download that build's artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "${{ steps.build.outputs.run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name darling-lol-linux-binaries \
+            --dir dist
+          ls -la dist
+          du -sh dist/*
+
+      - name: Check the artifacts really come from this commit
+        run: |
+          set -euo pipefail
+          grep -qx "commit: $GITHUB_SHA" dist/BUILD-INFO.txt \
+            || { echo "::error::dist/BUILD-INFO.txt does not name $GITHUB_SHA"; cat dist/BUILD-INFO.txt; exit 1; }
+          grep -q '^run: ' dist/BUILD-INFO.txt \
+            || { echo "::error::dist/BUILD-INFO.txt records no build run"; exit 1; }
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Re-running this job after a late failure must be safe: an existing release gets its
+          # assets refreshed in place instead of failing with "release already exists".
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::warning::release $GITHUB_REF_NAME already exists; refreshing its assets"
+            gh release upload "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            notes=$(printf 'Linux x86-64 binaries for %s, promoted unchanged from build run %s.' \
+              "$GITHUB_REF_NAME" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ steps.build.outputs.run_id }}")
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "$notes" \
+              --verify-tag
+          fi
