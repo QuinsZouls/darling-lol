@@ -2640,7 +2640,17 @@ index 5ae29bf4..358e606b 100644
              // NSLog(@"MotionNotify, x=%d, y=%d, xroot=%d, yroot=%d\n",
              // ev->xmotion.x, ev->xmotion.y, ev->xmotion.x_root,
              // ev->xmotion.y_root);
-@@ -1195,14 +1476,29 @@ static NSDictionary *modeInfoToDictionary(const XRRModeInfo *mi, int depth) {
+@@ -1165,7 +1446,8 @@ static NSDictionary *modeInfoToDictionary(const XRRModeInfo *mi, int depth) {
+                     transformPoint: NSMakePoint(ev->xmotion.x, ev->xmotion.y)];
+ 
+             CGFloat deltaX = pos.x - lastMotionPos.x;
+-            CGFloat deltaY = pos.y - lastMotionPos.y;
++            /* pos is in bottom-up window coordinates; NSEvent deltaY is positive downward. */
++            CGFloat deltaY = lastMotionPos.y - pos.y;
+ 
+             // NSLog(@"cursorGrabbed=%d, deltaX=%f, deltaY=%f\n",
+             // _cursorGrabbed, deltaX, deltaY);
+@@ -1195,14 +1477,29 @@ static NSDictionary *modeInfoToDictionary(const XRRModeInfo *mi, int depth) {
  
 +            [self pointerMoved];
              if (ev->xmotion.state & Button1Mask) {
@@ -2866,19 +2876,48 @@ index 5ae29bf4..358e606b 100644
  - (void) grabMouse: (BOOL) doGrab {
      if (doGrab) {
          NSWindow *nswin = [NSApp keyWindow];
-@@ -1495,9 +1890,10 @@ void CGNativeBorderFrameWidthsForStyle(NSUInteger styleMask, CGFloat *top,
+@@ -1490,36 +1886,30 @@ void CGNativeBorderFrameWidthsForStyle(NSUInteger styleMask, CGFloat *top,
+             nswin = [NSApp mainWindow];
+ 
+         X11Window *xwin = (X11Window *) [nswin platformWindow];
++        if (!xwin)
++            return;
+         Window win = [xwin windowHandle];
+         // Window win = DefaultRootWindow(_display);
          const unsigned int mask = ButtonPressMask | ButtonReleaseMask |
                                    PointerMotionMask | FocusChangeMask;
          int result = XGrabPointer(_display, win, False, mask, GrabModeAsync,
 -                                  GrabModeAsync, None, None, CurrentTime);
 +                                  GrabModeAsync, win, None, CurrentTime);
          if (result == GrabSuccess) {
-             _cursorGrabbed = YES;
-+            _confinedWindow = None;
+-            _cursorGrabbed = YES;
++            /* Wayland compositors (e.g. GNOME/Mutter) ignore XWarpPointer to
++             * DefaultRootWindow, leaving lastMotionPos frozen at the window
++             * center when _cursorGrabbed is set. Keep 1:1 pointer tracking
++             * inside the grabbed window instead of center-warping. */
++            _cursorGrabbed = NO;
++            _confinedWindow = win;
              NSLog(@"XGrabPointer() succeeded for window %lu\n", win);
- 
-             NSRect frame = [xwin transformFrame: nswin.frame];
-@@ -1522,6 +1918,9 @@ void CGNativeBorderFrameWidthsForStyle(NSUInteger styleMask, CGFloat *top,
+-
+-            NSRect frame = [xwin transformFrame: nswin.frame];
+-            // NSLog(@"Window's frame is at %f,%f, size %fx%f\n",
+-            // frame.origin.x, frame.origin.y, frame.size.width,
+-            // frame.size.height);
+-            CGPoint ptGlobal =
+-                    NSMakePoint(frame.size.width / 2.0 + frame.origin.x,
+-                                frame.size.height / 2.0 + frame.origin.y);
+-            CGPoint ptLocal = NSMakePoint(frame.size.width / 2.0,
+-                                          frame.size.height / 2.0);
+-
+-            // NSLog(@"setting last known pos in window to x=%f, y=%f\n",
+-            // ptLocal.x, ptLocal.y);
+-
+-            [xwin setLastKnownCursorPosition: [xwin transformPoint: ptLocal]];
+-            [self warpMouse: ptGlobal];
+         } else {
+             NSLog(@"XGrabPointer() failed with error %d for window %lu\n",
+                   result, win);
+         }
      } else {
          XUngrabPointer(_display, CurrentTime);
          _cursorGrabbed = NO;
