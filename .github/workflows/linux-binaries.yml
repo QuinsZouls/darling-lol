@@ -84,19 +84,27 @@ jobs:
       # must fail in seconds, not after the build.
       - name: Validate the release tag
         if: github.event.inputs.tag != ''
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # Passed through the environment and never interpolated into the script: the input
+          # is free text and `${{ ... }}` inside `run:` would be evaluated as shell code.
+          TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag }}"
-          case "$tag" in
-            v[0-9]*) ;;
-            *) echo "::error::tag '$tag' must look like v1.2.3: this workflow publishes on 'v*' tags"; exit 1 ;;
-          esac
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > /dev/null 2>&1; then
-            echo "::error::tag '$tag' already exists; choose the next version"; exit 1
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$TAG' must look like v1.2.3: this workflow publishes on 'v*' tags"; exit 1
           fi
-          echo "OK: $tag does not exist yet and will be created at $GITHUB_SHA if the build succeeds."
+          # Fail closed: only "(HTTP 404)" means the tag is free. 401/403/5xx/network errors
+          # must stop the run instead of being read as "available".
+          if probe=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>&1); then
+            echo "::error::tag '$TAG' already exists; choose the next version"; exit 1
+          fi
+          case "$probe" in
+            *'(HTTP 404)'*) : ;;
+            *) echo "::error::could not confirm that tag '$TAG' is free: $probe"; exit 1 ;;
+          esac
+          echo "OK: $TAG does not exist yet and will be created at $GITHUB_SHA if the build succeeds."
 
       # fetch-depth: 0 so `git describe --tags` can name the artifact from the tags.
       - name: Checkout
@@ -246,16 +254,17 @@ jobs:
         # the tag at the commit that was just built, so the tag can never point at
         # something that failed to build.
         if: github.event.inputs.tag != ''
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag }}"
-          gh release create "$tag" dist/* \
+          gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "$tag" \
-            --notes "Linux x86-64 binaries for $tag, built from $GITHUB_SHA by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+            --title "$TAG" \
+            --notes "Linux x86-64 binaries for $TAG, built from $GITHUB_SHA by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
 
   # Tagging is the release trigger. This job does NOT rebuild: it promotes the artifacts of
   # the newest successful manual build of this exact commit, so a release takes minutes and
@@ -313,14 +322,23 @@ jobs:
             || { echo "::error::dist/BUILD-INFO.txt records no build run"; exit 1; }
 
       - name: Publish the release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          notes=$(printf 'Linux x86-64 binaries for %s, promoted unchanged from build run %s.' \
-            "$GITHUB_REF_NAME" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ steps.build.outputs.run_id }}")
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --notes "$notes" \
-            --verify-tag
+          # Re-running this job after a late failure must be safe: an existing release gets its
+          # assets refreshed in place instead of failing with "release already exists".
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::warning::release $GITHUB_REF_NAME already exists; refreshing its assets"
+            gh release upload "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            notes=$(printf 'Linux x86-64 binaries for %s, promoted unchanged from build run %s.' \
+              "$GITHUB_REF_NAME" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ steps.build.outputs.run_id }}")
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "$notes" \
+              --verify-tag
+          fi
