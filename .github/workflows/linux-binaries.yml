@@ -102,6 +102,12 @@ jobs:
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::tag '$TAG' must look like v1.2.3 or v1.2.3-rc1: this workflow publishes on 'v*' tags"; exit 1
           fi
+          # A tag the regex accepts can still be an invalid git ref (trailing dot, `..`):
+          # the tag creation would then fail at the very end of the build, which is the class
+          # this pre-flight exists to catch. `git check-ref-format` is authoritative.
+          if ! git check-ref-format "refs/tags/$TAG"; then
+            echo "::error::tag '$TAG' is not a valid git ref name"; exit 1
+          fi
           # Fail closed: only "(HTTP 404)" means the tag is free. 401/403/5xx/network errors
           # must stop the run instead of being read as "available".
           if probe=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>&1); then
