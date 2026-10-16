@@ -1,0 +1,217 @@
+name: Linux binaries
+
+# Builds the pinned + patched Darling runtime for x86-64 and publishes the resulting
+# binaries as workflow artifacts, and as GitHub Release assets on `v*` tags.
+#
+# Binaries are NEVER committed to the repository: scripts/validate.py rejects any
+# tracked file that looks binary (ELF/MZ/Mach-O magic, NUL bytes, non-UTF8, or the
+# .so/.dylib/.zip/... suffixes), so the only delivery channels are
+# `actions/upload-artifact` and `gh release create`.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'Build the full pinned Darling runtime (slow)'
+        type: boolean
+        default: true
+      runtime_overrides:
+        description: 'Also build the experimental per-user runtime overrides'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Cheap gate, runs on every push/PR. `scripts/validate.py` is the repository's real
+  # source-package gate; the unit tests must also stay green.
+  source-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate the source package
+        run: python3 scripts/validate.py
+
+      - name: Run the unit tests
+        # Requires Python >= 3.12: the tests subclass pathlib.Path with
+        # `*parts, **kwargs`, which Python 3.11's object.__init__ rejects.
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+  # Heavy build. Pull requests only run the cheap gates above: a full pinned build
+  # takes 1-6 h and produces binaries that a PR cannot consume.
+  linux-binaries:
+    needs: source-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    # Only this job writes: it attaches the tarballs to the release for `v*` tags.
+    permissions:
+      contents: write
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.event.inputs.build == 'true')
+    steps:
+      # fetch-depth: 0 so `git describe --tags` can name the artifact from the tags.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Must run BEFORE setup-python: $AGENT_TOOLSDIRECTORY is where setup-python
+      # installs the pinned interpreter, so deleting it afterwards would silently
+      # fall back to the (possibly older) system Python and break the tests.
+      - name: Free disk space
+        shell: bash
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+          du -sh .
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the base toolchain
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git git-lfs cmake make clang lld build-essential pkg-config bison flex \
+            xz-utils unzip curl ca-certificates python3-venv xvfb
+          git lfs install --skip-repo
+
+      - name: Configure the checkout
+        run: |
+          python3 scripts/configure.py --guest-user runner
+          python3 -m venv build/venv
+          build/venv/bin/pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Fetch the pinned Darling sources and apply the patches
+        # Clones darlinghq/darling at the pinned revision, initializes submodules/LFS
+        # and applies all 29 patches. Prints progress; may take a while. build.sh
+        # runs prepare.py again later, which is a no-op on a prepared tree: this
+        # explicit step exists so the pinned debian/control is available to the
+        # dependency step below and so a clone/patch failure is reported on its own.
+        run: python3 scripts/prepare.py
+
+      - name: Install the pinned build dependencies
+        shell: bash
+        run: |
+          sudo apt-get install -y --no-install-recommends devscripts equivs debhelper
+          # The fork has no debian/ directory of its own: the pinned upstream control
+          # file only exists once prepare.py has cloned build/darling-src.
+          if ! sudo mk-build-deps --install --remove \
+               --tool 'apt-get --no-install-recommends -y' \
+               build/darling-src/debian/control; then
+            echo "::warning::mk-build-deps failed; falling back to an explicit apt dependency list"
+            sudo apt-get install -y --no-install-recommends \
+              cmake clang lld bison flex pkg-config libfuse-dev libudev-dev \
+              libcairo2-dev libgl1-mesa-dev libtiff-dev libfreetype-dev libelf-dev \
+              libxml2-dev libegl1-mesa-dev libglu1-mesa-dev libfontconfig1-dev \
+              libbsd-dev libxrandr-dev libxcursor-dev libgif-dev libavcodec-dev \
+              libavformat-dev libswresample-dev libavutil-dev libpulse-dev \
+              libdbus-1-dev libxkbfile-dev libcap-dev libcap2-bin llvm-dev \
+              libvulkan-dev libx11-dev libxext-dev libx11-xcb-dev libxcb-shm0-dev
+          fi
+
+      - name: Build the runtime
+        run: ./scripts/build.sh
+
+      - name: Install the runtime and record the manifest
+        shell: bash
+        run: |
+          set -o pipefail
+          # `sudo tee` merges cmake's stderr into the log; pipefail keeps cmake's
+          # exit status authoritative instead of tee's.
+          sudo cmake --install build/darling-src/build 2>&1 | sudo tee build/install.log > /dev/null
+          # Exact list of everything cmake installed, straight from the log.
+          ( grep -a '^-- Installing: ' build/install.log || true ) \
+            | sed 's|^-- Installing: ||' | sort -u > build/installed-files.txt
+          wc -l build/installed-files.txt
+
+      - name: Build the per-user runtime overrides (experimental)
+        # Experimental: scripts/install-runtime.sh needs a working `darling shell`
+        # prefix/namespace, which may not function in a headless CI runner. It must
+        # never invalidate the base runtime artifact, hence continue-on-error.
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.runtime_overrides == 'true'
+        continue-on-error: true
+        timeout-minutes: 60
+        run: xvfb-run -a ./scripts/install-runtime.sh || ./scripts/install-runtime.sh
+
+      - name: Package the Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="darling-lol-linux-x86_64-$(git describe --tags --always)"
+
+          # Base runtime: exactly the tree cmake installed under the prefix.
+          if [ -s build/installed-files.txt ]; then
+            sudo tar -C / -czf "dist/$name-base-runtime.tar.gz" -T build/installed-files.txt
+          else
+            echo "::warning::empty install manifest; falling back to the default prefix paths"
+            sudo tar -C / -czf "dist/$name-base-runtime.tar.gz" --ignore-failed-read \
+              usr/local/libexec/darling usr/local/bin/darlingserver
+          fi
+
+          # Runtime artifacts: the small top-level files in build/ (install logs,
+          # lists, config.json) plus build/runtime (the rendered per-user tools).
+          # We deliberately avoid recursing into the multi-GB build tree, so
+          # build/darling-src and build/venv are never packaged.
+          find build -maxdepth 1 -type f -print > build/runtime-artifact-files.txt
+          echo build/runtime >> build/runtime-artifact-files.txt
+          tar -C . -czf "dist/$name-runtime-artifacts.tar.gz" \
+            --exclude='build/darling-src' --exclude='build/venv' \
+            -T build/runtime-artifact-files.txt
+
+          # Build metadata.
+          {
+            echo "repo: $GITHUB_REPOSITORY"
+            echo "commit: $GITHUB_SHA"
+            echo "ref: $GITHUB_REF_NAME"
+            echo "components: $(python3 -c "import json;print(len(json.load(open('upstream/manifest.json'))['components']))")"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "uname: $(uname -a)"
+          } > dist/BUILD-INFO.txt
+          cp build/install.log dist/
+          cp build/installed-files.txt dist/
+
+          ls -la dist
+          du -sh dist/*
+
+      - name: Upload the artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: darling-lol-linux-binaries
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish the release
+        # Needs `permissions: contents: write`, set at the workflow level.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "Linux x86-64 binaries built from $GITHUB_SHA." --verify-tag
