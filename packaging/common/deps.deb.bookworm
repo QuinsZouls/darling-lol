@@ -1,0 +1,40 @@
+# packaging/common/deps.deb.bookworm -- runtime Depends for Debian 12 (bookworm).
+# Same sonames as noble, different package names for the t64 transition and the older ffmpeg.
+# ⚠️ Compatibility courtesy, not a promise (PLAN §8.1, risk R4): libavcodec.so.60 is dlopen'd by
+# name from a guest wrapper, so on bookworm the dlopen fails even though libavcodec59 satisfies
+# our Depends. The bookworm .deb is published only if G-VERIFY-3 passes.
+libc6 (>= 2.36)
+libstdc++6
+libgcc-s1
+libgl1
+libegl1
+libglu1-mesa
+libvulkan1
+# noble calls this libfuse2t64
+libfuse2
+libx11-6
+libxext6
+libxcursor1
+libxrandr2
+libxkbfile1
+libcairo2
+libfontconfig1
+libfreetype6
+# noble: libpng16-16t64
+libpng16-16
+# noble: libjpeg-turbo8
+libjpeg62-turbo
+libgif7
+libtiff6
+libpulse0
+libdbus-1-3
+libsystemd0
+libcrypt1
+# noble: libavcodec60 (ffmpeg 5.1 vs 6.x)
+libavcodec59
+libavformat59
+libavutil57
+libswresample3
+xdg-utils
+dbus
+python3

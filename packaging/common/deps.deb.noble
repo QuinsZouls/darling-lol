@@ -1,0 +1,35 @@
+# packaging/common/deps.deb.noble -- runtime Depends for Ubuntu 24.04 (noble).
+# One entry per line; render.sh joins them with ", " into the control file's Depends: field.
+# Source: the 36 dlopen'd host sonames + 3 executables of EVIDENCE §2, mapped to noble package
+# names. libpcre.so.0 is deliberately absent: PCRE1 is uninstallable on noble and on Fedora 41.
+libc6 (>= 2.39)
+libstdc++6
+libgcc-s1
+libgl1
+libegl1
+libglu1-mesa
+libvulkan1
+libfuse2t64
+libx11-6
+libxext6
+libxcursor1
+libxrandr2
+libxkbfile1
+libcairo2
+libfontconfig1
+libfreetype6
+libpng16-16t64
+libjpeg-turbo8
+libgif7
+libtiff6
+libpulse0
+libdbus-1-3
+libsystemd0
+libcrypt1
+libavcodec60
+libavformat60
+libavutil58
+libswresample4
+xdg-utils
+dbus
+python3

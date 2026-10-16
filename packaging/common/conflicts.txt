@@ -1,0 +1,26 @@
+# packaging/common/conflicts.txt -- one upstream binary package name per line (PLAN §5.1).
+# Upstream ships these names (debian/control + rpm/darling.spec %package stanzas, EVIDENCE C10).
+# Every one of them owns /usr/bin/darling, /usr/bin/darlingserver and /usr/libexec/darling/** --
+# the exact same paths this project owns after the /usr prefix build -- so the conflict is
+# path-level and unavoidable, not stylistic. Renderers: deb joins with ", ", rpm/arch with " ".
+darling
+darling-core
+darling-system
+darling-cli
+darling-extra
+darling-gui
+darling-gui-stubs
+darling-ffi
+darling-iokitd
+darling-jsc
+darling-python2
+darling-perl
+darling-ruby
+darling-pyobjc
+darling-iosurface
+darling-cli-extra
+darling-cli-devenv
+darling-cli-gui-common
+darling-cli-devenv-gui-common
+darling-cli-python2-common
+darling-cli-devenv-gui-stubs-common

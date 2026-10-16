@@ -1,0 +1,33 @@
+# packaging/common/deps.rpm.fc41 -- runtime Requires: for Fedora 41.
+# One entry per line; render.sh emits one "Requires: <entry>" line each (PLAN §8.2).
+# ffmpeg is intentionally NOT a hard Requires: Fedora 41 ships ffmpeg 7.x (libavcodec.so.61) while
+# the payload dlopen's .so.60, so depending on ffmpeg-libs would be *satisfied* while the runtime
+# still fails. The spec template carries "Recommends: ffmpeg-libs" instead (weak dep, ignored by
+# bare rpm -i -- exactly the semantics we want).
+glibc
+libstdc++
+libgcc
+mesa-libGL
+mesa-libEGL
+mesa-libGLU
+vulkan-loader
+fuse-libs
+libX11
+libXext
+libXcursor
+libXrandr
+libxkbfile
+cairo
+fontconfig
+freetype
+libpng
+libjpeg-turbo
+giflib
+libtiff
+pulseaudio-libs
+dbus-libs
+systemd-libs
+libxcrypt
+xdg-utils
+dbus
+python3
