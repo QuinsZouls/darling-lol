@@ -1,0 +1,65 @@
+# darling-lol-launcher -- the per-user launcher glue for darling-lol (PLAN 10.2, PLAN 14).
+#
+# Same skeleton as darling-lol.spec.in, with four differences that are the whole point of the
+# split (PLAN 5): BuildArch: noarch, its own file list (packaging/common/stage.sh step 4), a
+# Requires on the exact runtime build, and no %post -- the launcher has no maintainer script at
+# all because it owns nothing the system has to be told about (no setuid, no binfmt, no daemon).
+#
+# The files here are TEMPLATES, never rendered: HOST_HOME / GUEST_USER / GUEST_HOME / DPREFIX are
+# per-user, so a system-wide render would bake in the *build* user's home (PLAN 14, EVIDENCE 3).
+# The wrapper renders them into ~/.local/share/darling-lol on first use.
+# The same pin as darling-lol.spec.in, and the same measured reason (PLAN 10.1, C12): PLAN 10.1
+# writes w19T.zstd, rpmbuild 4.20.1 refuses it (`Unknown payload compression`, rc=1) while
+# `rpmspec -P` still exits 0, and rpmio's zstd compressor is named zstdio.
+%global _binary_payload w19T.zstdio
+%global _buildshell /bin/bash
+
+Name:           darling-lol-launcher
+Version:        @RPM_VERSION@
+Release:        @RPM_RELEASE@
+Summary:        per-user launcher for the darling-lol runtime
+License:        GPL-3.0-or-later
+URL:            https://github.com/QuinsZouls/darling-lol
+Source0:        %{name}-%{version}-root.tar.zst
+Source1:        %{name}-filelist.txt
+Source2:        %{name}-copyright.txt
+Source3:        %{name}-BUILD-INFO.txt
+
+# The launcher is useless without the runtime (it hardcodes --sdk /usr/libexec/darling), so the
+# dependency is pinned to the exact build the templates were tested against.
+Requires:       darling-lol = %{version}-%{release}
+Requires:       python3
+Requires:       bash
+Requires:       coreutils
+
+# BuildArch: noarch is the ONLY value BuildArch accepts (PLAN 10.2, C43-l): a specific
+# architecture must be written ExclusiveArch. The runtime package pins ExclusiveArch: x86_64; this
+# one is architecture-independent because it owns a shell wrapper and its python tooling.
+BuildArch:      noarch
+
+%description
+Per-user launcher for the darling-lol runtime: the darling-lol wrapper, the
+launcher templates and the audit tools. It renders the per-user configuration
+into ~/.local/share/darling-lol on first run and never writes a rendered file
+into a system directory.
+
+Install darling-lol first (or at the same time): this package requires it.
+
+%prep
+# nothing to unpack: Source0 is the staged launcher tree, handled in %%install
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+tar -xp --numeric-owner -Jf %{SOURCE0} -C %{buildroot}
+install -D -m 0644 %{SOURCE2} %{buildroot}%{_docdir}/%{name}/copyright
+install -D -m 0644 %{SOURCE3} %{buildroot}%{_docdir}/%{name}/BUILD-INFO.txt
+
+# %files -f %{SOURCE1} is the launcher list produced by packaging/common/stage.sh step 4
+# (`/usr/bin/darling-lol`, `/usr/lib/darling-lol/**`, `/usr/share/doc/darling-lol/**` -- the last
+# one keeps the fork's own README-packaging.md, which is why this package owns it and the runtime
+# does not: the runtime's list is stage.sh's `files.runtime`, i.e. files.all minus files.launcher).
+%files -f %{SOURCE1}
+%defattr(-,root,root,-)
+%doc %{_docdir}/%{name}/copyright
+%doc %{_docdir}/%{name}/BUILD-INFO.txt
