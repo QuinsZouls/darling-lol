@@ -30,8 +30,9 @@ sed 's|^/||' "$list" | grep -vE '^usr/libexec/darling/' > "$root.host.paths"
 if [ -s "$root.host.paths" ]; then
   ( cd "$root" && tr '\n' '\0' < "$root.host.paths" \
       | xargs -0 -r grep -In 'usr/local' 2>/dev/null ) > "$root.host.hits" || true
-  # The ONLY allowed host-side text hits are the launcher's 7 allowlisted fork files (PLAN 4.1).
-  # One line of reason per file; every one of them is a READER of a prefix, never a write target:
+  # The ONLY allowed host-side text hits are the launcher's 8 allowlisted fork files (PLAN 4.1;
+  # the 8th was added by the upstream merge, see below). One reason per file; every one of them is
+  # a READER of a prefix, never a write target:
   #   usr/bin/darling-lol -- the launcher entry point. Its /usr/local strings are the FALLBACK
   #     candidate prefixes (the published tarball's prefix) and the documentation of them; they
   #     are what G-LAUNCH-1 cases A/C2/D exercise, so they cannot be removed. Measured: the 6
@@ -43,13 +44,17 @@ if [ -s "$root.host.paths" ]; then
   #     twins (R-2): a /usr/local/libexec/darling path that is dead once config.json exists, not a
   #     write target. Path-exact, by name: the allowlist cannot inspect content, so a wildcard here
   #     would exempt every future tool.
+  #   tools/build-riot-urlsession-check.py:16 -- the same FALLBACK-reader class as the two power
+  #     checks above: args.sdk or config.get('sdk', …) fires only when build/config.json is absent,
+  #     and the wrapper's configure.py --sdk always writes that file first. NEW on upstream main:
+  #     the merge added it to the verbatim-staged tools/, which is what turned G-PREFIX-1 red.
   #   tools/riot_overlay_audit.py:9 -- prose in a docstring.
   # install-riot-darling-server.py is deliberately NOT allowlisted: T1 removed its literal, so a
   # regression there must fail this gate (mutation M7 -- it WAS a write target, i.e. a live bug).
-  if grep -vE '^(usr/bin/darling-lol|usr/lib/darling-lol/(scripts/common\.py|tools/((build-riot-power-(assertion|notify)-check|build-riot-(metal-presentation|x11-runtime))\.py|riot_overlay_audit\.py))):' \
+  if grep -vE '^(usr/bin/darling-lol|usr/lib/darling-lol/(scripts/common\.py|tools/((build-riot-power-(assertion|notify)-check|build-riot-(metal-presentation|x11-runtime))\.py|build-riot-urlsession-check\.py|riot_overlay_audit\.py))):' \
        "$root.host.hits" | grep -q .; then
     echo "PREFIX: FATAL unexplained host-side /usr/local references:" >&2
-    grep -vE '^(usr/bin/darling-lol|usr/lib/darling-lol/(scripts/common\.py|tools/((build-riot-power-(assertion|notify)-check|build-riot-(metal-presentation|x11-runtime))\.py|riot_overlay_audit\.py))):' \
+    grep -vE '^(usr/bin/darling-lol|usr/lib/darling-lol/(scripts/common\.py|tools/((build-riot-power-(assertion|notify)-check|build-riot-(metal-presentation|x11-runtime))\.py|build-riot-urlsession-check\.py|riot_overlay_audit\.py))):' \
       "$root.host.hits" | head -20 >&2
     fail=1
   fi

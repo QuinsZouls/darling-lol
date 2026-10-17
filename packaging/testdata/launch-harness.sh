@@ -518,11 +518,16 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
       "$(find "$P/usr/share/doc/darling-lol" -type f | wc -l | tr -d ' ')" 1
   chk "R8b and it is README-packaging.md" \
       "$(find "$P/usr/share/doc/darling-lol" -type f -name README-packaging.md | wc -l | tr -d ' ')" 1
-  allowed='^(usr/bin/darling-lol|usr/lib/darling-lol/(scripts/common\.py|tools/((build-riot-power-(assertion|notify)-check|build-riot-(metal-presentation|x11-runtime))\.py|riot_overlay_audit\.py)))$'
+  # This is the SECOND copy of check-prefix.sh's allowlist: the R block recomputes the payload's
+  # facts with `find`/`grep` rather than shelling out to the gate. 🚨 The two must move together:
+  # T8c added the 8th entry below and this count went 7 -> 8 in the same commit. Measured with only
+  # check-prefix.sh fixed: R9 stayed green by accident (7 matching lines) and R9b went red,
+  # PASS=83 FAIL=1.
+  allowed='^(usr/bin/darling-lol|usr/lib/darling-lol/(scripts/common\.py|tools/((build-riot-power-(assertion|notify)-check|build-riot-(metal-presentation|x11-runtime))\.py|build-riot-urlsession-check\.py|riot_overlay_audit\.py)))$'
   hits=$(find "$P/usr/bin" "$P/usr/lib/darling-lol" -type f -exec grep -Il 'usr/local' {} + 2>/dev/null \
            | sed "s|^$P/||" | sort)
-  chk "R9 the staged /usr/local text hits are exactly the 7 allowlisted readers" \
-      "$(printf '%s\n' "$hits" | grep -cE "$allowed")" 7
+  chk "R9 the staged /usr/local text hits are exactly the 8 allowlisted readers" \
+      "$(printf '%s\n' "$hits" | grep -cE "$allowed")" 8
   chk "R9b no staged file outside the allowlist carries /usr/local" \
       "$(printf '%s\n' "$hits" | grep -vcE "$allowed")" 0
   printf '%s\n' "$hits" | sed 's/^/     allowlisted: /'

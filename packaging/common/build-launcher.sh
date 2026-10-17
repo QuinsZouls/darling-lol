@@ -21,7 +21,7 @@
 #   usr/lib/darling-lol/tools/**                  <- tools/ VERBATIM, modes preserved (cp -a)
 #   usr/share/doc/darling-lol/README-packaging.md <- packaging/install/README-packaging.md.in
 #
-# 🚨 scripts/ is NOT copied verbatim: it holds 12 files and 3 of them contain `usr/local`
+# 🚨 scripts/ is NOT copied verbatim: it holds 13 files and 3 of them contain `usr/local`
 # (build.sh, build-packaging.sh, common.py). Only the two named above ship; copying the others
 # trips the /usr/local content sweep in check-prefix.sh (G-PREFIX-1).
 # 🚨 Nothing under usr/lib/darling-lol may contain /home/runner: the templates ship
@@ -100,8 +100,8 @@ done
 [ -x "$root/usr/bin/darling-lol" ] || die "$root/usr/bin/darling-lol is not executable"
 
 # 5. Two properties of the shipped payload, asserted count-agnostically. Never assert a file
-#    count here: tools/ holds 205 top-level files plus 14 in subdirectories on this commit and
-#    has drifted before (the plan-era pin said 190).
+#    count here: tools/ holds 212 top-level files plus 14 in subdirectories on this commit (226 in
+#    all; the pre-merge tree had 205 + 14) and has drifted before (the plan-era pin said 190).
 n_tok=$(grep -rl '@GUEST_HOME@' "$root/usr/lib/darling-lol/tools" 2>/dev/null | wc -l | tr -d ' ')
 [ "$n_tok" -gt 0 ] || die "no @GUEST_HOME@ under $root/usr/lib/darling-lol/tools: the templates must ship UNRENDERED"
 if grep -rl '/home/runner' "$root/usr/bin/darling-lol" "$root/usr/lib/darling-lol" 2>/dev/null | grep -q .; then
