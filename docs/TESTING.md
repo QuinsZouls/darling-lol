@@ -18,6 +18,54 @@ The LLVM version check compiles Iridium's actual dynamic loader against small st
 
 The patch check uses temporary base indexes and does not reset or modify the source checkout. The launcher check uses stub commands and never starts or contacts Riot or Darling. It checks installed-client and first-time-installer launches, strips inherited `DYLD_INSERT_LIBRARIES` even with the old VPX opt-in set, and preserves Darling runtime library/framework paths. The memory-installer check imports the installer and exercises its policy (default source is the prepared artifact; the artifact is never a destination of a different library) in temporary directories. The Foundation-installer check does the same for the overlay installer: it seeds a temporary framework from a stub SDK, replaces `Versions/C/Foundation`, keeps the standard symlinks, stages a backup, treats a re-run as current and refuses a non-Mach-O source. The installer handoff mock covers 28 scenarios, including HTTP 409, interrupted verification and preserving active downloads.
 
+## NSURLSession lifecycle regression
+
+After configuring and building the patched Darling source:
+
+```sh
+python3 tools/build-riot-urlsession-check.py
+python3 tools/riot-urlsession-check.py
+```
+
+The runner starts a loopback-only HTTP fixture, reserves a second non-listening
+port for the transport-error case, and creates a fresh private DPREFIX. It runs
+only the independent probe, then shuts down that private prefix. It never
+starts Riot/League, queries their APIs, sends game input or shuts down the
+normal prefix. The fixture delays its response so session invalidation is
+tested with a request still outstanding. Run native guest probes with clients
+and the game closed; source-only CI does not run them.
+
+The builder accepts `--build-dir` and `--sdk` for an existing configured tree.
+The runner accepts `--frameworks` and `--libraries` host paths for installed
+overlays, and keeps diagnostics in mode-0600 `build/urlsession-check.log`.
+
+Expected checks: five successful HTTP GETs with exact response bytes/status;
+connection refusal delivered as an error; repeated resume/cancel without
+duplicate completion; finish waiting for task completion; and session
+invalidation delivered once for both graceful finish and cancellation.
+Expected output includes `URLSESSION_PASS` and `LIFECYCLE_PASS`. The original
+runtime aborts on missing data-task initialization or session invalidation.
+These checks do not establish full NSURLSession conformance or transport-level
+interruption of an already-running request.
+
+Host-only checks, which do not start Darling:
+
+```sh
+python3 tools/riot-cdn-dns-offline-check.py
+python3 -m unittest discover -s tests -p 'test_hidden_riot_recovery.py'
+python3 -m unittest discover -s tests -p 'test_desktop_run.py'
+python3 -m unittest discover -s tests -p 'test_urlsession_runner.py'
+```
+
+The DNS check compiles the actual `dr_query` addition from `Libinfo.patch`
+against stub resolver functions. It covers default/opt-out behavior, case
+insensitivity, A queries, non-CDN names and misleading domain suffixes without
+sending a DNS query. Recovery tests use fake `/proc` entries and mock every
+compositor/shutdown command. The desktop test checks exit/argument forwarding,
+append-only output and tightening an existing public log to mode 0600. The
+runner test uses a fake `darling` executable to verify loopback fixtures and
+private-prefix-only shutdown/cleanup.
+
 ## CoreText font-list and AppKit resize regressions
 
 After preparing the source and configuring the runtime tools:
@@ -90,6 +138,7 @@ Useful probes (build tokenized Python helpers from `build/runtime/tools/`):
 - `m327-cgl-resolver-check`: first calls through dynamically looked-up GL functions retain floating-point arguments; expected `first_sampler_linear=1 first_color_arguments=1 errors=0,0`. Build with `build-m58f327-opengl.py` and run with `run-riot-native-check.py m327-cgl-resolver-check`.
 - `m327-cgl-direct-check`: with `RCLOL_GPU_DIRECT_OTHER_WINDOW_TEST=1` and an owned 337x339 native target, interleave 338x339 fallback surfaces; expected `active_presenter_preserved=1 fallback_frames=357`. This needs the native presentation fixture; it is not a `run-riot-native-check.py` choice.
 - `riot-metal-presentation-check`: Vulkan clear reaches the GL texture, including late window/context attachment. Set `RIOT_PRESENTATION_NESTED=1` to place the Metal layer beneath two ordinary layers and verify that its drawables are still presented and recycled past the three-drawable pool limit.
+- `riot-ca-render-policy-check`: headless check of the actual compositor render policy. A nested Metal layer must still be prepared when a full-window IOSurface is present; surface-only trees should retain the local-render shortcut. Built by `build-riot-metal-presentation.py`; expected `PASS: mixed-tree Metal preparation survives IOSurface shortcut`. Creates no window or GPU work and does not publish its test surface.
 - `riot-metal-concurrency-check`: submission ordering, resource lifetime and concurrent recording.
 
 `RIOT_PRESENTATION_STRESS=1` makes the presentation probe run 120 frames. With the game and clients closed, force async encoding for this standalone probe using the guest flag `/tmp/metal-async-encode`, then remove it. The tested old path leaked 120 synchronization FDs over 120 frames; the fixed path leaked zero. Inspect the probe's host `/proc/PID/fd` for `anon_inode:syncobj_file` if reproducing that test.

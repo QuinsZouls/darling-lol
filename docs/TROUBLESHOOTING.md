@@ -56,6 +56,73 @@ The installer fetcher no longer treats a missing archive `Info.plist` or the inf
 
 There is also a separate known compatibility gap: native LaunchAgent watch registration can return HTTP 409 after the League install path is accepted, leaving the download idle. A historical inspector hook handles this and interrupted `pending_verify` states in 28 mock cases, but that hook is disabled in normal launches and excluded from the manual workflow. There is no verified runtime-only replacement for that handoff in this snapshot. Do not assume the native permission and launcher fixes resolve every idle Install case, or enable debugger/API automation to work around it.
 
+## Riot exits and League reports that it lost its connection
+
+Check the launcher stderr or `build/desktop-launch.log` when launched through
+the generated application-menu entry. The following Objective-C exceptions
+were observed immediately before RiotClientServices aborted:
+
+```
+-[NSURLSessionDataTask initWithRequest:completionHandler:]: unrecognized selector
+-[NSURLSession finishTasksAndInvalidate]: unrecognized selector
+```
+
+League then reports localhost connection refusal and loses its external-client
+authorization. Restarting temporarily clears the broken session, but does not
+implement the missing methods. The CFNetwork patch now supplies a minimal
+completion-handler data-task implementation, uses the existing NSURLConnection
+transport on a worker, and tracks outstanding tasks while a session finishes
+or cancels. Session factories create the concrete CFNetwork session so its
+delegate-queue storage is not confused with the public class's synthesized
+properties. The URL convenience method also preserves GET rather than forcing POST.
+
+Rebuild and install the base and paired runtime with both clients and the game
+closed. Run the standalone NSURLSession regression in [testing](TESTING.md#nsurlsession-lifecycle-regression).
+This is partial NSURLSession compatibility: in-flight cancellation reports the
+cancellation once but does not interrupt the synchronous transport already in
+progress. Completion handlers use a global worker queue rather than the
+session's delegate queue. Delegate-only data tasks, suspension, background
+sessions, downloads and uploads are not established by these tests.
+
+### Client remains running without a window
+
+New launches can exit with `Client already running, exiting` when a stale Riot
+session has no visible window. After exiting the game and clients, `darling
+shutdown` followed by `scripts/run.sh` recovers this case without deleting game
+files. For a dedicated Riot installation in the default prefix, Hyprland users
+can opt in to automatic recovery:
+
+```sh
+RCLOL_RECOVER_HIDDEN_CLIENT=1 ./scripts/run.sh
+```
+
+The helper requires an owned Riot process in the default prefix and a successful
+Hyprland window query. It preserves a running game, any visible Riot/League
+window, foreign-owned processes and custom prefixes, and takes no action when
+ownership or window information cannot be read. A hidden background client or
+download is restarted when recovery is enabled. Other desktop environments are
+not supported by this helper; recovery is off by default.
+
+### Downloads repeatedly fail with an IPv6 CONNECT_TO error
+
+The bundled downloader was observed retrying CDN chunks with:
+
+```
+Use of IPv6 in *_CONNECT_TO without IPv6 support built-in
+```
+
+The launcher now defaults `RCLOL_CDN_IPV4_ONLY=1`. The Libinfo resolver suppresses
+AAAA queries only for subdomains of `riotcdn.net`, retaining IPv4 DNS rotation,
+TLS and the normal resolver for all other names. It does not pin CDN addresses
+or disable IPv6 on the Linux host. Opt out with:
+
+```sh
+RCLOL_CDN_IPV4_ONLY=0 ./scripts/run.sh
+```
+
+The resolver change requires a rebuilt/installed base runtime. The environment
+flag alone cannot alter an older Libinfo binary.
+
 ## Riot closes after a network lookup is cancelled
 
 Two local crashes were traced to `CFNetwork::_HostCancel` calling `CFRetain(NULL)`.
@@ -186,7 +253,7 @@ On Hyprland, also check that direct scanout is off (`hyprctl getoption render:di
 
 ## Hybrid graphics laptops (AMD/Intel iGPU + NVIDIA)
 
-Metal renders with Vulkan, and each finished frame is handed to an OpenGL (EGL) context that presents it. The hand-off uses opaque file descriptors, which only work when Vulkan and OpenGL run on the same GPU. Indium takes the first Vulkan device the loader lists, and on a hybrid laptop both that device and the EGL context are normally the integrated GPU, so the discrete GPU stays idle. A report in [issue #3](https://github.com/lucannez64/darling-lol/issues/3) (Ryzen 9 5900HS, RTX 3060 Laptop) measured 60-70 FPS in ARAM on the integrated GPU; on the NVIDIA GPU the game showed a black screen. **Running on an NVIDIA GPU is not validated.**
+Metal renders with Vulkan, and each finished frame is handed to an OpenGL (EGL) context that presents it. The hand-off uses opaque file descriptors, which only work when Vulkan and OpenGL run on the same GPU. Indium takes the first Vulkan device the loader lists, and on a hybrid laptop both that device and the EGL context are normally the integrated GPU, so the discrete GPU stays idle. A report in [issue #3](https://github.com/lucannez64/darling-lol/issues/3) (Ryzen 9 5900HS, RTX 3060 Laptop) measured 60-70 FPS in ARAM on the integrated GPU; on the NVIDIA GPU the game showed a black screen. On a single-GPU NVIDIA desktop the game now runs; see [NVIDIA proprietary driver](#nvidia-proprietary-driver) for what changed and what is still limited.
 
 ### Run on the discrete GPU
 
@@ -233,6 +300,17 @@ The first import of a drawable into the presenting OpenGL context, and the first
 A non-zero error or `FAILED` means the frames cannot reach the window. Before 2026-10-16 the import did not mark the memory as dedicated, which the extension requires; Mesa ignores it, and it is the suspected cause of the NVIDIA black screen (not yet confirmed). An NVIDIA log of 2026-10-16 showed `glTiling=optimal` with `setup_error=0x501 storage_error=0x501 FAILED`: NVIDIA's GL rejects `GL_LINEAR_TILING_EXT`, so the linear Vulkan image could not be imported. Since then the internal image and the GL texture use optimal tiling when `GL_VENDOR` contains NVIDIA (`vkTiling=optimal glTiling=optimal ok` is the expected line); everything else keeps linear. If the game shows a black screen on NVIDIA, report it with this file.
 
 An additional NVIDIA report on `68f816d` showed successful optimal-tiling import but repeated `Metal Device timed out giving us a Drawable to present` messages. Its [presentation trace](https://github.com/lucannez64/darling-lol/issues/3#issuecomment-6214732591) shows all three drawables queued and all three main-thread presentation callbacks running, followed by timeouts with three frames still queued. The compositor only prepared a Metal layer when it was the root layer, skipping nested Metal layers. It now prepares Metal layers throughout the tree. A standalone nested-layer reproduction exhausts the pool before this correction and passes ten presentations with pixel readback after it; the root-layer probe also passes. Confirmation on the reporter's NVIDIA system is still needed.
+
+### NVIDIA proprietary driver
+
+Exercised on a single-GPU RTX 3060 desktop (driver 615.71, sway with Xwayland), playing custom matches. The client window still needs `RCLOL_GPU_DIRECT_PRESENT=0`: the direct GPU path reports no error, but its window stays black.
+
+- **Black game window, surface.** The compositor subwindow inherited its parent's GLX visual, and NVIDIA's EGL refuses a window surface for a config with another visual (`EGL_BAD_CONFIG`); Mesa accepts the mismatch. The subwindow is now created with the visual of CGL's EGL config (`CGLGetNativeVisualID`).
+- **Black game window, drawing.** The compositor context is first made current without a surface, so its default framebuffer kept `GL_NONE` as draw buffer after a window surface was attached, and NVIDIA discarded every composite. Attaching a new window surface now restores `GL_BACK`. `riot-metal-presentation-check` with `RIOT_PRESENTATION_HOLD=<seconds>` keeps presenting, so the window's real pixels can be read from the host.
+- **Frozen frame over the client.** With CPU readback the local compositor drew Chromium surfaces from a texture loaded once whenever the layer tree was not one full-window surface (the Practice Tool lobby video) and left that frame over the live client. In readback mode it now composites only trees that contain a Metal layer. On sway the client also stays visible during a match, because sway ignores X11 minimize requests.
+- **Aborts during a match.** NVIDIA's driver opens a `/dev/nvidia0` descriptor per Vulkan memory allocation, about 6,800 in a match, while Darling processes inherited the launching shell's limit (2048 here) and mldr keeps each thread's darlingserver socket just below it. The launcher now raises the soft limit to 65536, `setrlimit` no longer lowers `RLIMIT_NOFILE` (the game asks for 10240, which lowered a higher Linux limit and broke every later socket), and mldr logs socket and checkin failures as `LOLRPCSOCKET`/`LOLCHECKIN` in `/tmp/lolsig.log` and retries them.
+- **Signals on driver threads.** NVIDIA's driver threads do not block signals, so a process-directed signal (tmux sends `SIGWINCH` on every resize) could land on a thread without a darlingserver socket and abort the process. Such an asynchronous signal is now forwarded to the main thread.
+- **Frame rate.** NVIDIA's blocking `vkWaitSemaphores` wakes the waiter 1-2 ms after the GPU signals (an empty submit completes in about 15 us when polled). Indium now polls completion for up to 2 ms before blocking (guest file `/tmp/metal-wait-spin-us` sets the budget in microseconds, 0 disables it). A custom match went from about 20 to 27 FPS. The GPU still idles at low clocks, and an NVIDIA driver thread spends about 70% of a core in ioctls; locking the GPU clock did not help, and the cause is not identified yet.
 
 ### Host-side checks
 
