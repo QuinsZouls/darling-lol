@@ -1,0 +1,2 @@
+FROM ubuntu:24.04
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -yqq --no-install-recommends binutils util-linux python3 && rm -rf /var/lib/apt/lists/*
