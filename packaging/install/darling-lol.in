@@ -1,0 +1,127 @@
+#!/bin/sh
+# darling-lol -- render the per-user launcher if needed, then start the Riot client.
+#
+# The templates in TEMPLATES carry @HOST_HOME@ / @GUEST_USER@ / @GUEST_HOME@ / @DPREFIX@ /
+# @DARLING_SDK@ tokens; four of those are per-user, so they cannot be rendered into a read-only
+# system directory. We render into ~/.local/share/darling-lol on first use and whenever the
+# package is upgraded (detected by comparing a stamp file against BUILD-INFO).
+#
+# 🚨 The SDK prefix is DETECTED, not baked (PLAN 14.3). LIBEXEC_PATH/INSTALL_PREFIX are
+# compile-time strings, so the runtime cannot be relocated -- but this wrapper can easily end up
+# installed next to a runtime built for a DIFFERENT prefix (the published v0.1.0 tarball is
+# /usr/local; the .deb/.rpm/.pkg are /usr). Baking one path breaks the other, and it breaks at
+# container start, not at install time.
+set -eu
+
+die() { echo "darling-lol: $*" >&2; exit 1; }
+
+# ---- 1. locate the runtime prefix ----------------------------------------------------------
+# Candidate SDK dirs, most preferred first. @SDK@ is rendered at package time so the expected
+# prefix costs one stat; /usr/local/libexec/darling stays in the list because that is the prefix
+# of the already-published v0.1.0 tarball, which this plan does NOT declare incompatible (C30).
+# A prefix anywhere else -- including one under $HOME, e.g. a locally built runtime -- is reached
+# through DARLING_SDK below, not by growing this list.
+SDK_CANDIDATES="@SDK@ /usr/libexec/darling /usr/local/libexec/darling"
+[ -n "${DARLING_SDK:-}" ] && SDK_CANDIDATES="$DARLING_SDK ${SDK_CANDIDATES}"
+
+PREFIX=""; SDK=""
+for cand in $SDK_CANDIDATES; do
+    p=${cand%/libexec/darling}
+    [ "$p" != "$cand" ] || continue                 # not a .../libexec/darling path: ignore
+    [ -d "$cand" ] || continue
+    [ -x "$p/bin/darling" ] || continue
+    [ -x "$p/bin/darlingserver" ] || continue
+    # Authoritative test: the prefix COMPILED into darlingserver must be this one. grep -a, not
+    # strings(1) -- binutils is not a dependency of this package. -z -x, not -o: the payload's
+    # concatenated literal ".../libexec/darling/usr/libexec/darling/vchroot" contains BOTH
+    # prefixes as substrings, so an unanchored match picks the wrong one (EVIDENCE C28).
+    # The trailing /usr{,/local}/libexec/darling component is what must appear, which is also
+    # what lets a DARLING_SDK prefix outside /usr (a local build, a relocated tree) pass without a
+    # special case: the compiled string is matched, not the location.
+    exp=$(printf '%s' "$cand" | grep -oE '/usr(/local)?/libexec/darling$' || true)
+    [ -n "$exp" ] || continue
+    grep -aqzx -F -- "$exp" "$p/bin/darlingserver" 2>/dev/null || continue
+    PREFIX=$p; SDK=$cand; break
+done
+[ -n "$PREFIX" ] || die "no usable darling-lol runtime found.
+Tried (in order): $(for c in $SDK_CANDIDATES; do printf '%s ' "$c"; done)
+Each needs libexec/darling/, bin/darling, bin/darlingserver, and a darlingserver COMPILED for
+that prefix. Install the darling-lol runtime package, or set
+DARLING_SDK=/path/to/libexec/darling."
+
+# ---- 2. the templates ----------------------------------------------------------------------
+TEMPLATES=""
+for t in @TEMPLATES@ /usr/lib/darling-lol /usr/local/lib/darling-lol \
+         /usr/local/share/darling-lol /usr/share/darling-lol; do
+    [ -d "$t/scripts" ] && [ -d "$t/tools" ] && { TEMPLATES=$t; break; }
+done
+[ -n "$TEMPLATES" ] || die "no darling-lol launcher templates found (expected scripts/ + tools/
+under @TEMPLATES@, /usr/lib/darling-lol or /usr/local/share/darling-lol).
+The darling-lol-launcher package is not installed."
+
+DEST="${XDG_DATA_HOME:-$HOME/.local/share}/darling-lol"
+STAMP="$DEST/.rendered-from"
+
+# ---- 3. the setuid assertion (system prefixes only) ----------------------------------------
+# EVIDENCE C3: the bit is silently dropped by a plain `tar -x`, by some filesystems, and by
+# pacman hooks that cannot fail the transaction. A lost bit turns every launch into a confusing
+# permission error, so say what actually went wrong here, once, before anything is rendered.
+# The arm below is scoped deliberately: a prefix under $HOME is not a system prefix, and no setuid
+# bit is demanded of it. It is here because DARLING_SDK may point at a locally built or relocated
+# runtime (§14.3 item 3), where a 4755 darling is neither present nor meaningful -- a non-root user
+# cannot set the bit at all -- and where the die message below ("Reinstall the package") would be a
+# lie, because there is no package. (A setuid bit is also ignored inside a user namespace: §23.)
+# 🚨 rev 5 / C32: this used to read `case "$PREFIX" in "$HOME"/.darling-lol/*)`, which was NARROWER
+# than this comment -- ~/.darling-lol was the discarded rootless mode's install root, so a local
+# build at $HOME/build/darling was wrongly demanded 4755, and after the 2026-10-16 ruling the arm
+# was dead code naming a deleted path. The guard below is load-bearing, not decoration: with HOME
+# unset or "/", a naive "$HOME"/* expands to /* and matches EVERY absolute prefix, silently
+# disabling the assertion (mutant L4b, caught only by case F2). Executed by G-LAUNCH-1 cases I and
+# F2; mutants L4 (arm reverted to the old pattern) and L4b (guard dropped) fire.
+NONSYSTEM=0
+case "${HOME:-}" in
+    ""|"/") ;;                                                  # no usable $HOME: never skip
+    *)      case "$PREFIX" in "$HOME"/*) NONSYSTEM=1 ;; esac ;;
+esac
+if [ "$NONSYSTEM" = 0 ]; then
+    mode=$(stat -c '%a' "$PREFIX/bin/darling")
+    [ "$mode" = 4755 ] || die "$PREFIX/bin/darling is mode $mode, expected 4755 (setuid root).
+Reinstall the package; if it persists, your package manager or filesystem is dropping setuid bits
+(noexec/nosuid mount, or an extractor without --preserve-permissions)."
+fi
+
+# ---- 4. who is the guest user? -------------------------------------------------------------
+# `id -un` FAILS (exit 1, empty stdout, noise on stderr) for a uid with no /etc/passwd entry --
+# LDAP/SSSD with enumerate=false, a container, a synthetic mapped uid. That is the same shape as
+# the runtime's own getpwuid() exit(1) (EVIDENCE C26, darling.c:1023-1027), and it reaches us
+# first: configure.py calls configuration() unconditionally, which calls getpass.getuser(), which
+# raises KeyError. Measured: a Python traceback plus the misleading "is python3 installed?"
+# (EVIDENCE C29). Two fixes, both needed:
+#   * a name we can always compute, so --guest-user is never empty;
+#   * LOGNAME in the environment, because getpass.getuser() consults LOGNAME/USER/LNAME/USERNAME
+#     BEFORE pwd.getpwuid() -- without it, configuration() raises even when --guest-user is given.
+me=$(id -un 2>/dev/null) || me="uid$(id -u)"
+
+# ---- 5. render on first use / after an upgrade ---------------------------------------------
+pkg_id=$(sed -n 's/^commit: //p' "$PREFIX/share/doc/darling-lol/BUILD-INFO.txt" 2>/dev/null \
+         || echo unknown)
+# The stamp records prefix AND commit: switching from a /usr/local tarball to a /usr package must
+# re-render, because @DARLING_SDK@ is baked into every one of the 190 templates.
+stamp_val="$PREFIX $pkg_id"
+
+if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$stamp_val" ]; then
+    echo "darling-lol: rendering the launcher for $me into $DEST ..."
+    echo "darling-lol: prefix=$PREFIX sdk=$SDK templates=$TEMPLATES"
+    rm -rf "$DEST/scripts" "$DEST/tools" "$DEST/build"
+    mkdir -p "$DEST"
+    cp -a "$TEMPLATES/scripts" "$TEMPLATES/tools" "$DEST/"
+    # project_root self-derives from the script location (scripts/common.py:3), so copying is
+    # enough -- nothing has to be told where $DEST is.
+    ( cd "$DEST" && LOGNAME="$me" USER="$me" python3 scripts/configure.py \
+        --guest-user "${DARLING_GUEST_USER:-$me}" \
+        --prefix "${DPREFIX:-$HOME/.darling}" \
+        --sdk "$SDK" ) || die "configure.py failed; is python3 installed?"
+    printf '%s\n' "$stamp_val" > "$STAMP"
+fi
+
+exec sh "$DEST/build/runtime/tools/run-riot-client.sh" "$@"

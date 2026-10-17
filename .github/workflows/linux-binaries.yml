@@ -660,6 +660,16 @@ jobs:
           # reused tree is D1's silent failure mode.
           JOBS="$(nproc)" sh scripts/build-packaging.sh
 
+      - name: Stage the launcher payload into the staging tree (T8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Renders @SDK@/@TEMPLATES@ for the /usr package and copies the launcher payload
+          # (wrapper + scripts/{configure,common}.py + tools/** + README-packaging.md) into the
+          # staging tree. Must run AFTER build-packaging.sh (whose pre-flight refuses a non-empty
+          # tree) and BEFORE stage.sh (whose step 3b sweeps the payload and whose step 4 lists it).
+          sh packaging/common/build-launcher.sh "$DARLING_PKG_DIST/pkg/root"
+
       - name: Stage the tree and build every format
         shell: bash
         env:

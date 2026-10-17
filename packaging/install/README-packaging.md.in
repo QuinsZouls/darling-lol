@@ -1,0 +1,38 @@
+# darling-lol — packaging notes
+
+This file is installed as `/usr/share/doc/darling-lol/README-packaging.md`. It is owned by the
+**darling-lol-launcher** package; the runtime package owns
+`/usr/share/doc/darling-lol/copyright` and `/usr/share/doc/darling-lol/BUILD-INFO.txt`. Both
+packages share the directory, and that is deliberate — only the *files* are disjoint.
+
+## What the launcher package installs
+
+* `/usr/bin/darling-lol` — the entry point.
+* `/usr/lib/darling-lol/scripts/{configure.py,common.py}` and `/usr/lib/darling-lol/tools/**` —
+  the templates, shipped **unrendered**: `@HOST_HOME@`, `@GUEST_USER@`, `@GUEST_HOME@`,
+  `@DPREFIX@`, `@DARLING_SDK@` and `@PROJECT_ROOT@` are still tokens.
+
+Nothing under `/usr/lib/darling-lol` is ever written to. It is read-only, root-owned content.
+
+## Why the templates ship unrendered
+
+Five of the six tokens are per-user values, so they cannot be baked into a read-only system
+directory. On first use `darling-lol` copies the templates into `~/.local/share/darling-lol` and
+renders them there with `configure.py`; it re-renders whenever the recorded prefix or the runtime's
+commit changes, so a package upgrade is picked up automatically.
+
+## How the runtime prefix is found
+
+`darling-lol` does not bake a runtime prefix. It walks a short candidate list — `$DARLING_SDK`
+first, then the prefix this package was built for, then the conventional system locations — and
+accepts the first candidate that has a `darlingserver` **compiled** for that prefix. The runtime
+prefix is a compile-time string, so a wrapper installed next to a runtime built for a different
+prefix is a launch-time failure; it is checked rather than assumed. `DARLING_SDK` always wins and
+is the supported way to point the launcher at a locally built runtime.
+
+## Reporting a packaging problem
+
+Use the fork's issue tracker. Include your distribution and its version, plus the first lines the
+launcher prints:
+
+    darling-lol 2>&1 | head -20
