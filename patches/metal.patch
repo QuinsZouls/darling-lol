@@ -13,6 +13,17 @@ index 431f29a..7f10875 100644
  		src/Metal/MTLCommandQueue.mm
  		src/Metal/MTLCompileOptions.mm
  		src/Metal/MTLComputeCommandEncoder.mm
+@@ -97,6 +99,10 @@ if (BUILD_METAL)
+ 	target_compile_definitions(Metal PUBLIC
+ 		DARLING_METAL_ENABLED=1
+ 	)
++	# MTLDevice.mm reads the Vulkan device properties from Indium's private headers.
++	target_link_libraries(Metal PRIVATE
++		indium_private
++	)
+ endif()
+ 
+ #
 diff --git a/include/Metal/MTLCommandBuffer.h b/include/Metal/MTLCommandBuffer.h
 index ef43df8..9045a84 100644
 --- a/include/Metal/MTLCommandBuffer.h
