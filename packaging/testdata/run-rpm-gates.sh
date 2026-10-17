@@ -21,12 +21,16 @@
 #
 #       docker build -t darling-rpm-gates:fc41 - <<'EOF'
 #       FROM fedora:41
-#       RUN dnf -y install rpm-build rpmlint xz diffutils binutils && dnf clean all
+#       RUN dnf -y install rpm-build rpmlint xz diffutils binutils zstd && dnf clean all
 #       EOF
 #       T4_RPM_IMAGE=darling-rpm-gates:fc41 bash packaging/testdata/run-rpm-gates.sh
 #
 #                             binutils is what the G-RPM-5 witness needs (as/ld/objdump); the
 #                             fedora:41 tag satisfies it through rpm-build's own dependencies.
+#                             zstd is named EXPLICITLY (it also arrives transitively: rpm-build
+#                             Requires: zstd) because the builder now writes Source0 with `zstd`
+#                             -- C50/R1: the `.tar.zst` name is a promise about the BYTES -- and
+#                             the image must never be the thing that silently decides otherwise.
 #   T4_GATES_BREAK=<name>     negative-control hook: break the OBJECT under test and re-run (see
 #                             the bottom of this file). Unset in a normal run.
 #   T4_GATES_CONTROLS=<spec>  `all` (default) or a space-separated subset of the control names.
@@ -58,7 +62,8 @@ fi
 
 CONTROL_NAMES="post-mode-target unquote-list autoreqprov dir-drop attr-weaken \
 token-inline launcher-autoreq deps-drop comment-macro arch-spelling stage-break \
-witness-autoreq escape-inert payload-elf"
+witness-autoreq escape-inert payload-elf payload-xz changelog-clock buildinfo-payload \
+file-listed-twice launcher-manifest"
 # every control names the row it must turn red; the sweep asserts THAT row fails, that the child
 # run fails at all, and that the break itself was not a no-op.
 ctl_row() {
@@ -77,6 +82,11 @@ ctl_row() {
     witness-autoreq)  echo "G-RPM-5 C11 witness: the sonotype is absent under AutoReqProv: no" ;;
     escape-inert)     echo "G-RPM-5 the %a mutation of TASKS.md T4 is inert on this toolchain" ;;
     payload-elf)      echo "G-RPM-5 the auto-reqprov sensor is live on this toolchain (launcher interp)" ;;
+    payload-xz)       echo "G-RPM-2 Source0 is real zstd under the .tar.zst name (C50/R1)" ;;
+    changelog-clock)  echo "G-RPM-1 the %changelog pins the package's source date (SOURCE_DATE_EPOCH), not the clock" ;;
+    buildinfo-payload) echo "G-RPM-2 BUILD-INFO.txt's rpm-payload equals the spec's pin (w19T.zstdio)" ;;
+    file-listed-twice) echo "G-RPM-2 one entry per path: the %attr lines replace the plain entries (0 'File listed twice')" ;;
+    launcher-manifest) echo "G-RPM-2 the launcher rpm owns exactly its staged paths plus the two %doc files" ;;
     *)                echo "" ;;
   esac
 }
@@ -181,6 +191,16 @@ depauto() { # depauto FILE [NAME] -- count of 'auto' deptypes (for NAME when giv
     awk -F'|' -v n="${2-}" '$2 ~ /(^|,)auto($|,)/ && (n == "" || $1 == n) { c++ } END { print c+0 }' "$O/$1"
   else echo missing; fi
 }
+interpdep() { # interpdep FILE -- 1 when an auto-injected row is THE launcher's script interp require
+  # MENOR-5: match the NAME as a whole path, so both the payload's own shebang spelling (`/bin/sh`)
+  # and a usrmerged build root's normalised one (`/usr/bin/sh`, what Fedora's rpmbuild injects here)
+  # are accepted. `subdep FILE /bin/sh` cannot do this: it tests `index($1, s) > 0`, i.e. a SUBSTRING
+  # NOT AT OFFSET 0 -- so the exact name `/bin/sh` scores 0 and the row would go red with a
+  # misleading "sensor is not live" message on a non-usrmerged root.
+  if [ -f "$O/$1" ]; then
+    awk -F'|' '$1 ~ /^\/(usr\/)?bin\/sh$/ && $2 ~ /(^|,)auto($|,)/ { c++ } END { print c+0 }' "$O/$1"
+  else echo missing; fi
+}
 rc()   { if [ -f "$O/$1.rc" ]; then cat "$O/$1.rc"; else echo missing; fi; }
 
 # ================================================================================================
@@ -210,7 +230,11 @@ chk "container runtime" "$DOCKER" "$DOCKER"
 # with no rpm still proves what CI will ship -- and prove the shipped arch is x86_64 while the
 # fixture is free to be rewritten. --render-only stops after step 7 (specs + sources, no rpmbuild).
 mkdir -p "$O" "$HO" "$HOSTDIST"
-( cd "$SRC" && DARLING_PKG_DIST="$HOSTDIST" sh packaging/common/build-rpm.sh fixture --render-only ) \
+# SOURCE_DATE_EPOCH pins the %changelog date (C54) so the shipped render is a literal rather than
+# "whatever day the gate ran", exactly like the container's own shipped render -- the two are
+# compared byte-for-byte below.
+( cd "$SRC" && DARLING_PKG_DIST="$HOSTDIST" SOURCE_DATE_EPOCH=1700000000 \
+    sh packaging/common/build-rpm.sh fixture --render-only ) \
   > "$HO/host-render.log" 2>&1
 echo $? > "$HO/host-render.rc"
 cp "$HOSTDIST/pkg/rpmbuild/SPECS/darling-lol.spec"          "$HO/spec-host-runtime.txt"  2>/dev/null || :
@@ -243,10 +267,15 @@ mkdir -p "$OUT"
 
 printf '%s\n' "$(uname -m)" > "$OUT/uname-m.txt"
 rpm --version > "$OUT/rpm-version.txt" 2>&1
-for t in rpmbuild rpmspec rpmlint as ld objdump; do
+for t in rpmbuild rpmspec rpmlint as ld objdump zstd; do
   if command -v "$t" >/dev/null 2>&1; then "$t" --version 2>&1 | head -1 > "$OUT/tool-$t.txt"
   else echo absent > "$OUT/tool-$t.txt"; fi
 done
+# The %changelog date the battery pins for the shipped renders (SOURCE_DATE_EPOCH=1700000000).
+# Collected here, in the same clock/TZ context as the build, so the host row compares two values
+# produced by the same rules rather than by the reader's local `date`.
+date -u -d @1700000000 '+%a %b %d %Y' > "$OUT/pin-date.txt" 2>/dev/null \
+  || printf 'no-gnu-date\n' > "$OUT/pin-date.txt"
 
 # The fixture must be buildable HERE: the shipped runtime spec pins ExclusiveArch x86_64 and
 # rpmbuild refuses a foreign arch outright. The knob is fixture-only (build-rpm.sh ignores it for a
@@ -274,7 +303,7 @@ case "$BRK" in
   unquote-list) break_one "$SRC/packaging/common/build-rpm.sh" 's/if (!(t in skip)) print }/if (!(t in skip)) print t }/' ;;
   autoreqprov)  break_one "$SRC/packaging/rpm/darling-lol.spec.in" 's/^AutoReqProv:    no$/AutoReqProv:    yes/' ;;
   dir-drop)     break_one "$SRC/packaging/common/build-rpm.sh" 's|done < "$pkg/files.emptydirs" > "$tmp/block.emptydirs"|done < /dev/null > "$tmp/block.emptydirs"|' ;;
-  attr-weaken)  break_one "$SRC/packaging/common/build-rpm.sh" 's#darling|%{_bindir}/darling|4755#darling|%{_bindir}/darling|0755#; s#server|%{_bindir}/darlingserver|0755#server|%{_bindir}/darlingserver|0644#' ;;
+  attr-weaken)  break_one "$SRC/packaging/common/build-rpm.sh" 's#^usr/bin/darling|4755$#usr/bin/darling|0755#; s#^usr/bin/darlingserver|0755$#usr/bin/darlingserver|0644#' ;;
   token-inline) break_one "$SRC/packaging/rpm/darling-lol.spec.in" 's|^@RPM_REQUIRES@$|Requires:       @RPM_REQUIRES@|' ;;
   launcher-autoreq) break_one "$SRC/packaging/rpm/darling-lol-launcher.spec.in" 's|^Name:           darling-lol-launcher$|Name:           darling-lol-launcher\nAutoReqProv:    no|' ;;
   deps-drop)    break_one "$SRC/packaging/common/deps.rpm.fc41" '/^fuse-libs$/d' ;;
@@ -284,17 +313,47 @@ case "$BRK" in
   payload-elf)  break_one "$SRC/packaging/testdata/mkprefixfixture.sh" \
                   's|> "$_g/usr/lib/libguest.bin"$|> /dev/null; cp /usr/bin/rpm "$_g/usr/lib/libguest.bin"|' ;;
   witness-autoreq) ;; # not a source mutation: it un-sets the witness's own switch, below
+  payload-xz)   break_one "$SRC/packaging/common/build-rpm.sh" \
+                  "s|-I 'zstd -19 -T0' -cf|-cJf|g; s|28b52ffd ]|\${_magic} ]|" ;;
+  changelog-clock) break_one "$SRC/packaging/common/build-rpm.sh" 's|SOURCE_DATE_EPOCH:-}|NEVER_SET}|' ;;
+  buildinfo-payload) break_one "$SRC/packaging/common/build-rpm.sh" \
+                  "s|RPM_PAYLOAD=\"\$rpm_payload\"|RPM_PAYLOAD=\"w19T.zstd\"|" ;;
+  file-listed-twice) break_one "$SRC/packaging/rpm/darling-lol.spec.in" \
+                  's|^%defattr(-,root,root,-)$|%defattr(-,root,root,-)\n/usr/lib/binfmt.d/darling.conf|' ;;
+  launcher-manifest) break_one "$SRC/packaging/rpm/darling-lol-launcher.spec.in" \
+                  's|^%files -f %{SOURCE1}$|%files|' ;;
   *) echo "BREAK-UNKNOWN: $BRK"; exit 4 ;;
 esac
 
 # --- 1. the production path: fixture = mkfixture.sh -> stage.sh -> render.sh -> rpmbuild ---------
 cd /work
 export DARLING_PKG_DIST="$DIST"
+# The %changelog date is pinned for every fixture build here, not left to the day the gate runs:
+# C54's date is taken from SOURCE_DATE_EPOCH when it is set, so pinning it makes the rendered spec
+# a literal AND makes the built spec byte-comparable with the shipped one (the arch knob may touch
+# exactly one line, and the date is not that line).
+export SOURCE_DATE_EPOCH=1700000000
 sh "$SRC/packaging/common/build-rpm.sh" fixture > "$OUT/build.log" 2>&1
 echo $? > "$OUT/build.rc"
 
+# --- 1b. the zstd guard: with zstd unreachable the builder must REFUSE, not fall back to xz -----
+# A PATH built out of symlinks to the tools the builder needs, minus zstd: everything else works,
+# so the only thing that can make this run fail is the compressor. The row asserts the FATAL text
+# AND the nonzero rc, i.e. that the refusal is the guard's and not a random missing binary.
+mkdir -p /work/nozstd
+for _t in dirname cat grep sed awk tr cmp comm sort diff cp mv rm mkdir find tar stat date od \
+          printf head wc uname install expr dirname sha256sum; do
+  _p=$(command -v "$_t" 2>/dev/null) && ln -sf "$_p" "/work/nozstd/$_t" 2>/dev/null
+done
+env PATH=/work/nozstd DARLING_PKG_DIST=/work/nozstd-dist /bin/sh "$SRC/packaging/common/build-rpm.sh" \
+    fixture --render-only > "$OUT/nozstd.log" 2>&1
+echo $? > "$OUT/nozstd.rc"
+printf '%s\n' "$(command -v zstd 2>/dev/null || echo none)" > "$OUT/zstd-path.txt"
+
 # --- 2. the same render with the knob OFF: what CI ships, provable here with no rpmbuild --------
-RPM_FIXTURE_ARCH= DARLING_PKG_DIST=/work/shipped \
+# SOURCE_DATE_EPOCH is pinned so the %changelog date in the shipped render is a literal rather than
+# whatever day the gate ran -- and so the host's render-only run (same pin) is byte-comparable.
+RPM_FIXTURE_ARCH= DARLING_PKG_DIST=/work/shipped SOURCE_DATE_EPOCH=1700000000 \
   sh "$SRC/packaging/common/build-rpm.sh" fixture --render-only > "$OUT/renderonly.log" 2>&1
 echo $? > "$OUT/renderonly.rc"
 
@@ -333,6 +392,25 @@ RT=$(ls "$OUT"/rpms/darling-lol-[0-9]*.rpm 2>/dev/null | head -1)
 LT=$(ls "$OUT"/rpms/darling-lol-launcher-[0-9]*.rpm 2>/dev/null | head -1)
 printf '%s\n' "${RT##*/}" > "$OUT/rpm-runtime.txt"
 printf '%s\n' "${LT##*/}" > "$OUT/rpm-launcher.txt"
+
+# --- 3b. Source0's BYTES, measured: the `.tar.zst` name is a promise about the compression -------
+# The two readers that trust the name -- `zstd -t` and `tar --zstd -tf` -- are exactly the ones an
+# xz payload (magic fd377a585a00) takes down (`tar -Jtf` instead reads ONLY xz: measured, rc=2 on a
+# real zstd tar). Collected here, asserted on the host, so the gate cannot accept a name lie.
+: > "$OUT/tar-magic.txt"
+: > "$OUT/zstd-test.log"
+: > "$OUT/tar-zstd-list.txt"
+zstd_rc=0
+tarzstd_rc=0
+for t in "$DIST"/pkg/*-root.tar.zst; do
+  [ -e "$t" ] || continue
+  printf '%s %s\n' "${t##*/}" "$(od -An -tx1 -N4 "$t" | tr -d ' \n')" >> "$OUT/tar-magic.txt"
+  zstd -t "$t" >> "$OUT/zstd-test.log" 2>&1 || zstd_rc=1
+  tar --zstd -tf "$t" >> "$OUT/tar-zstd-list.txt" 2>> "$OUT/zstd-test.log" || tarzstd_rc=1
+done
+echo $zstd_rc > "$OUT/zstd-test.rc"
+echo $tarzstd_rc > "$OUT/tar-zstd-consumer.rc"
+cp "$DIST/pkg/darling-lol-BUILD-INFO.txt" "$OUT/BUILD-INFO.txt" 2>/dev/null || :
 
 # --- 4. the metadata queries --------------------------------------------------------------------
 if [ -n "$RT" ]; then
@@ -399,6 +477,33 @@ if command -v rpmlint >/dev/null 2>&1 && [ -n "$RT" ] && [ -n "$LT" ]; then
   rpmlint "$RT" "$LT"                                   > "$OUT/rpmlint-nocfg.txt"  2>&1; echo $? > "$OUT/rpmlint-nocfg.rc"
 else
   for n in cfg file nocfg; do : > "$OUT/rpmlint-$n.txt"; echo 127 > "$OUT/rpmlint-$n.rc"; done
+fi
+
+# The per-filter analysis runs IN HERE, not on the host: the container is where the config and the
+# no-config output are, and it always carries python3 (the host may not -- MENOR-6, where the
+# strongest G-RPM-4 assertion used to collapse to a grep while the row kept its "load-bearing"
+# name). `filters.rc` tells the host whether the analysis ran at all.
+if command -v python3 >/dev/null 2>&1 && [ -s "$OUT/rpmlint-nocfg.txt" ]; then
+  python3 - "$OUT/rpmlint-config.toml" "$OUT/rpmlint-nocfg.txt" > "$OUT/filters.txt" 2>&1 <<'PY'
+import re, sys, tomllib
+cfg = tomllib.load(open(sys.argv[1], 'rb'))
+lines = [l for l in open(sys.argv[2], encoding='utf-8', errors='replace').read().splitlines() if ': E: ' in l]
+filters = cfg.get('Filters', [])
+dead = [f for f in filters if not any(re.search(f, l) for l in lines)]
+unexplained = [l for l in lines if not any(re.search(f, l) for f in filters)]
+print("filters=%d" % len(filters))
+print("dead=%d" % len(dead))
+print("errors=%d" % len(lines))
+print("unexplained=%d" % len(unexplained))
+for l in dead:
+    print("DEAD: " + l)
+for l in unexplained:
+    print("UNEXPLAINED: " + l)
+PY
+  echo $? > "$OUT/filters.rc"
+else
+  echo "no-python3" > "$OUT/filters.txt"
+  echo 127 > "$OUT/filters.rc"
 fi
 
 # --- 7. install it: the %post has to run, the modes have to survive extraction, and the empty ---
@@ -529,11 +634,20 @@ chk "G-RPM-0 the image ran and reported its toolchain (rpm $(val rpm-version.txt
 uncollected=
 for f in build.rc spec-runtime.txt spec-shipped-runtime.txt stage-darling-lol-filelist.txt \
          stage-files.runtime stage-files.quoted stage-files.emptydirs staged-modes.txt \
-         dump-runtime.txt list-runtime.txt reqnames-runtime.txt deptypes-runtime.txt \
-         filecaps-runtime.txt recommends-runtime.txt installed-mode.txt witness-yes.requires.txt; do
+         dump-runtime.txt list-runtime.txt list-launcher.txt dump-launcher.txt reqnames-runtime.txt \
+         deptypes-runtime.txt \
+         filecaps-runtime.txt recommends-runtime.txt installed-mode.txt witness-yes.requires.txt \
+         BUILD-INFO.txt tar-magic.txt zstd-test.rc filters.txt; do
   [ -s "$O/$f" ] || uncollected="$uncollected $f"
 done
 chk "G-RPM-0 the run collected every artifact the rows below read" "${uncollected:-none}" "none"
+# The honest residual (MENOR-4): `requires-runtime.txt` (`rpm -qp --requires`) is still collected and
+# not read by a row. It is deliberately left that way -- it is the SAME query as reqnames-runtime.txt
+# (`--qf '[%{REQUIRENAME}\n]'`), differing only by the rpmlib version constraints, and the reviewed
+# list carries no version operator at all (deps.rpm.fc41 is 27 unversioned names). Any row comparing
+# the two would be a tautology on a single `rpm -qp`, i.e. a ghost row by construction: no control
+# could redden one side without the other. The requirement CONTENT is asserted from reqnames (exact
+# set, 30 unique + 4 rpmlib) and from the render's own Requires: line in G-RPM-1/G-RPM-3.
 chk "G-RPM-0 the host render-only run exits 0 too" "$(cat "$HO/host-render.rc" 2>/dev/null || echo missing)" "0"
 
 sec "G-RPM-1  rpmspec -P parses the rendered spec (PLAN 10.3, TASKS.md T4)"
@@ -590,6 +704,20 @@ sa "the explicit list is the rendered one, not a hand-copied string" \
   "$(num spec-runtime.txt '^Requires:[[:space:]]*glibc$')" "1"
 end_row "G-RPM-1 the rendered spec pins AutoReqProv: no and states the deviation"
 
+sa "the shipped runtime spec carries a %changelog entry (C54: it is what gives rpm a source date)" \
+  "$(num spec-shipped-runtime.txt '^%changelog$')" "1"
+sa "the shipped launcher spec carries one too (both packages need it)" \
+  "$(num spec-shipped-launcher.txt '^%changelog$')" "1"
+sa "and its date is pinned from SOURCE_DATE_EPOCH, not from the clock ($(val pin-date.txt))" \
+  "$(lit spec-shipped-runtime.txt "$(val pin-date.txt)")" "1"
+sa "with the package's own version in the entry ($(val rpm-runtime.txt))" \
+  "$(num spec-shipped-runtime.txt '^\* .* darling-lol maintainers - 0\.1\.0-1\.lol\.fc41$')" "1"
+sa "so rpmbuild has a date to take: no 'changelog has no entries' warning (C54)" \
+  "$(lit build.log 'changelog has no entries')" "0"
+sa "and rpmlint no longer has an E: no-changelogname-tag to filter (the filter is deleted, R2)" \
+  "$(lit rpmlint-config.toml "'no-changelogname-tag',")" "0"
+end_row "G-RPM-1 the %changelog pins the package's source date (SOURCE_DATE_EPOCH), not the clock"
+
 sec "G-RPM-2  rpmbuild -bb succeeds, and the payload metadata is the staged tree's own"
 
 chk "G-RPM-2 rpmbuild -bb builds exactly the two packages" \
@@ -633,9 +761,43 @@ sa "the payload token is the rpmio spelling, not the plan's (see the T4 report)"
   "$(num spec-runtime.txt '^%global _binary_payload w19T.zstdio$')" "1"
 end_row "G-RPM-2 the payload is zstd level 19T, pinned in the spec"
 
-# %files -f <list>: byte-identical to what stage.sh wrote, minus the launcher's paths and minus the
-# %dir block's paths -- and no re-quoting anywhere (EVIDENCE 7.2's silent corruption).
-sed 's/^"//; s/"$//; s|^/||' "$O/stage-darling-lol-filelist.txt" | LC_ALL=C sort > "$WORK/fl.stripped"
+# Source0's BYTES: the `.tar.zst` name is a promise (C50/R1). The measured spell is `tar -I zstd`
+# -- it writes real zstd AND reads both flavours -- while `-J` is xz and `-Jtf` reads ONLY xz
+# (measured: rc=2 `xz: File format not recognized` on a real zstd tar). So the name stays and the
+# bytes are forced to match it: never a silent xz fallback, and the two name-trusting readers below
+# (`zstd -t`, `tar --zstd`) are exactly what an xz payload takes down.
+sa "both Source0 tars start with the zstd magic 28b52ffd, not xz's fd377a585a00" \
+  "$(num tar-magic.txt '^darling-lol-[0-9.]+-root\.tar\.zst 28b52ffd$')$(num tar-magic.txt '^darling-lol-launcher-[0-9.]+-root\.tar\.zst 28b52ffd$')" "11"
+sa "and no Source0 tar carries the xz magic (the name lie the gate exists to catch)" \
+  "$(num tar-magic.txt 'fd377a585a00')" "0"
+sa "zstd -t validates both payloads (the reader that trusts the name)" "$(rc zstd-test)" "0"
+sa "and a real zstd consumer reads them: tar --zstd lists $(cnt tar-zstd-list.txt) members" \
+  "$(if [ "$(rc tar-zstd-consumer)" = 0 ] && [ "$(cnt tar-zstd-list.txt)" -gt 0 ]; then echo ok; else echo "rc=$(rc tar-zstd-consumer) members=$(cnt tar-zstd-list.txt)"; fi)" "ok"
+sa "the spec unpacks Source0 with -I zstd -f, the ONE spelling measured to read both flavours" \
+  "$(lit spec-runtime.txt 'tar -xp --numeric-owner -I zstd -f %{SOURCE0} -C %{buildroot}')$(lit spec-launcher.txt 'tar -xp --numeric-owner -I zstd -f %{SOURCE0} -C %{buildroot}')" "11"
+sa "and no xz spelling (-J / -cJ) survives on either %install command line" \
+  "$(num spec-runtime.txt '^tar .* -J')$(num spec-launcher.txt '^tar .* -J')" "00"
+end_row "G-RPM-2 Source0 is real zstd under the .tar.zst name (C50/R1)"
+
+sa "the packaged BUILD-INFO.txt pins the rpmio spelling the spec pins (R5, the T4 -> T1 edge)" \
+  "$(num BUILD-INFO.txt '^rpm-payload: w19T\.zstdio$')" "1"
+sa "and not the plan's w19T.zstd, which rpmbuild rejects with 'Unknown payload compression'" \
+  "$(num BUILD-INFO.txt '^rpm-payload: w19T\.zstd$')" "0"
+sa "and the two sites agree character for character, so neither can rot alone" \
+  "$(sed -n 's/^rpm-payload: //p' "$O/BUILD-INFO.txt")" \
+  "$(sed -n 's/^%global _binary_payload //p' "$O/spec-shipped-runtime.txt" | head -1)" "w19T.zstdio"
+end_row "G-RPM-2 BUILD-INFO.txt's rpm-payload equals the spec's pin (w19T.zstdio)"
+
+# %files -f <list>: the generated list is stage.sh's quoted paths PLUS the hardened paths' %attr
+# lines, and the two halves are asserted separately. The %attr line REPLACES the path's plain entry
+# (C52: appending it instead is what rpm reports as `warning: File listed twice`), so the path half
+# must be byte-identical to what stage.sh wrote, minus the launcher's paths, minus the %dir block's
+# paths, and minus the hardened paths that hand their entry to an %attr line.
+grep -v '^%attr(' "$O/stage-darling-lol-filelist.txt" > "$WORK/fl.paths"
+sed -n 's/^%attr([^)]*) \(".*"\)$/\1/p' "$O/stage-darling-lol-filelist.txt" > "$WORK/fl.attrs.quoted"
+sed 's/^"//; s/"$//; s|^/||' "$WORK/fl.paths"        | LC_ALL=C sort > "$WORK/fl.stripped"
+sed 's/^"//; s/"$//; s|^/||' "$WORK/fl.attrs.quoted" | LC_ALL=C sort > "$WORK/fl.attrs.stripped"
+{ cat "$WORK/fl.stripped"; cat "$WORK/fl.attrs.stripped"; } | LC_ALL=C sort > "$WORK/fl.owned.stripped"
 sed 's/^"//; s/"$//; s|^/||' "$O/stage-files.quoted"             | LC_ALL=C sort > "$WORK/quoted.stripped"
 sed 's|^/||' "$O/stage-files.runtime"   | LC_ALL=C sort > "$WORK/fr.stripped"
 sed 's|^/||' "$O/stage-files.emptydirs" | LC_ALL=C sort > "$WORK/emptydirs.stripped"
@@ -649,21 +811,61 @@ grep -v '^#' "$WORK/conflicts.expected.raw" | grep -v '^[[:space:]]*$' | LC_ALL=
 LC_ALL=C sort -u "$O/conflicts-runtime.txt" > "$WORK/conflicts.actual"
 sed 's/\t.*//' "$O/filecaps-runtime.txt" | LC_ALL=C sort > "$WORK/filecaps.paths"
 LC_ALL=C sort "$O/list-runtime.txt"                            > "$WORK/list.sorted"
-sa "every runtime %files line is a byte-identical copy of a stage.sh line" \
-  "$(LC_ALL=C comm -23 "$WORK/fl.stripped" "$WORK/quoted.stripped" | wc -l | tr -d ' ')" "0"
-sa "and the runtime list is exactly files.runtime minus files.emptydirs" \
-  "$( { cat "$WORK/fl.stripped"; cat "$WORK/emptydirs.stripped"; } | LC_ALL=C sort | LC_ALL=C comm -3 - "$WORK/fr.stripped" | wc -l | tr -d ' ')" "0"
-sa "and it is 18 entries: 20 runtime paths minus the 2 empty dirs" \
-  "$(cnt stage-darling-lol-filelist.txt)$(cnt stage-files.runtime)" "1820"
-sa "every line of the runtime list is quoted (the only quoting that survives the space paths)" \
-  "$(awk '!/^".*"$/' "$O/stage-darling-lol-filelist.txt" | wc -l | tr -d ' ')" "0"
+sa "every owned runtime path is a byte-identical copy of a stage.sh line (no re-quoting)" \
+  "$(LC_ALL=C comm -23 "$WORK/fl.owned.stripped" "$WORK/quoted.stripped" | wc -l | tr -d ' ')" "0"
+sa "and the owned set is exactly files.runtime minus files.emptydirs" \
+  "$( { cat "$WORK/fl.owned.stripped"; cat "$WORK/emptydirs.stripped"; } | LC_ALL=C sort | LC_ALL=C comm -3 - "$WORK/fr.stripped" | wc -l | tr -d ' ')" "0"
+sa "and it is 18 owned paths: 20 runtime paths minus the 2 empty dirs" \
+  "$(wc -l < "$WORK/fl.owned.stripped" | tr -d ' ')$(cnt stage-files.runtime)" "1820"
+sa "every plain path line is quoted (the only quoting that survives the space paths)" \
+  "$(awk '!/^".*"$/' "$WORK/fl.paths" | wc -l | tr -d ' ')" "0"
 sa "the launcher list is stage.sh's files.launcher, copied as-is" \
   "$(cmp -s "$O/stage-files.launcher" "$O/stage-darling-lol-launcher-filelist.txt" && echo same || echo differs)" "same"
-sa "the two lists are disjoint (C18: no path is owned twice)" \
-  "$(LC_ALL=C comm -12 "$WORK/fl.stripped" "$WORK/launcher.stripped" | wc -l | tr -d ' ')" "0"
+sa "the two packages' owned paths are disjoint (C18: no path is owned twice)" \
+  "$(LC_ALL=C comm -12 "$WORK/fl.owned.stripped" "$WORK/launcher.stripped" | wc -l | tr -d ' ')" "0"
 sa "the runtime rpm owns exactly the staged paths plus the two %doc files %install adds" \
   "$(LC_ALL=C comm -3 "$WORK/list.expected" "$WORK/list.actual" | wc -l | tr -d ' ')" "0"
 end_row "the runtime %files list is stage.sh's quoted list, byte-for-byte"
+
+# C52/R3, one row of its own: the %attr lines are the hardened paths' ONLY entry, so the generated
+# list stays one entry per path. Appending them next to the plain paths is what rpm reports as
+# `warning: File listed twice` (measured on rpm 4.20.1: 3 distinct paths, 3 warnings) -- and a
+# duplicate is a WARNING with rc=0, so without this row a future append-style regression would be
+# silent. The row's control re-adds a duplicate to the spec and must turn it red.
+sa "the generated list carries the hardened paths as %attr lines (C52)" \
+  "$(wc -l < "$WORK/fl.attrs.quoted" | tr -d ' ')" "3"
+sa "and each %attr path is one of files.runtime's own (a %attr for an absent path is a hard error)" \
+  "$(LC_ALL=C comm -23 "$WORK/fl.attrs.stripped" "$WORK/fr.stripped" | wc -l | tr -d ' ')" "0"
+sa "the %attr lines REPLACE the plain entries, they do not repeat them (one entry per path)" \
+  "$(LC_ALL=C comm -12 "$WORK/fl.stripped" "$WORK/fl.attrs.stripped" | wc -l | tr -d ' ')" "0"
+sa "and rpm agrees: 0 'File listed twice' anywhere in the build (C52 cannot regress silently)" \
+  "$(lit build.log 'File listed twice')" "0"
+end_row "G-RPM-2 one entry per path: the %attr lines replace the plain entries (0 'File listed twice')"
+
+# MENOR-4: the launcher's OWN manifest was collected but never read -- its owned set was verified
+# only indirectly (its filelist copy plus the builder's invariant). This is the row that would
+# notice a %files-vs--f mistake in the launcher spec, and it makes the launcher symmetric with the
+# runtime, which gets five query rows.
+sed 's|^/||' "$O/list-launcher.txt" | LC_ALL=C sort > "$WORK/ll.actual"
+{ sed 's|^/||' "$O/stage-files.launcher"
+  printf '%s\n' usr/share/doc/darling-lol-launcher/copyright usr/share/doc/darling-lol-launcher/BUILD-INFO.txt
+} | LC_ALL=C sort > "$WORK/ll.expected"
+sa "the launcher rpm owns exactly its staged paths plus the two %doc files %install adds" \
+  "$(LC_ALL=C comm -3 "$WORK/ll.expected" "$WORK/ll.actual" | wc -l | tr -d ' ')" "0"
+sa "and no runtime path leaked into it (the split is one path, one owner)" \
+  "$(LC_ALL=C comm -12 "$WORK/launcher.stripped" "$WORK/fr.stripped" | wc -l | tr -d ' ')" "0"
+# MENOR-4, second half: `dump-launcher.txt` was collected and never read either (its only other
+# reader was its own collection line). These two assertions make it load-bearing, and unlike
+# `list-launcher.txt` they look at the PAYLOAD METADATA rather than the file list: the launcher spec
+# has no %attr block, so every mode that survives is the one Source0 carried -- and a launcher rpm
+# that owns nothing (the `launcher-manifest` control's `%files` in place of `%files -f`) cannot
+# satisfy either count. No literal count: both sides are the staged manifest's own size plus the two
+# %doc files %install adds, so T1 growing the launcher's file set cannot redden these by accident.
+sa "the launcher's payload metadata covers every path the package owns (staged + the two %doc files)" \
+  "$(cnt dump-launcher.txt)" "$(( $(cnt stage-files.launcher) + 2 ))"
+sa "and every one of those modes is 0644 or 0755: this spec has no hardened path, so Source0's own modes stand" \
+  "$(num dump-launcher.txt ' (0100644|0100755) ')" "$(( $(cnt stage-files.launcher) + 2 ))"
+end_row "G-RPM-2 the launcher rpm owns exactly its staged paths plus the two %doc files"
 
 sec "G-RPM-3  the metadata a broken install would hide (requires, conflicts, caps, %post)"
 
@@ -752,48 +954,37 @@ if [ "$(rc rpmlint-cfg)" = 127 ]; then
   sk "rpmlint is not in this image: G-RPM-4 unverified ($IMAGE)"
 else
   sa "rpmlint -c exits 0" "$(rc rpmlint-cfg)" "0"
-  sa "with 0 errors (13 warnings are tolerated by policy, PLAN 9.6's rule)" \
+  sa "with 0 errors (warnings are tolerated by policy, PLAN 9.6's rule; their count is not invariant)" \
     "$(lit rpmlint-cfg.txt ' 0 errors, ')" "1"
   sa "and the two packages really were checked" \
     "$(lit rpmlint-cfg.txt '2 packages and 0 specfiles checked')" "1"
   sa "no E: line survives" "$(lit rpmlint-cfg.txt ': E: ')" "0"
   end_row "G-RPM-4 rpmlint -c: rc=0, 0 errors"
 
-  sa "without the config rpmlint reports 26 errors and exits 64 -- the config is load-bearing" \
-    "$(rc rpmlint-nocfg)$(lit rpmlint-nocfg.txt ' 26 errors, ')" "641"
-  sa "and PLAN 10.3's literal --file does NOT load this TOML (same 26 errors, rc 64)" \
-    "$(rc rpmlint-file)$(lit rpmlint-file.txt ' 26 errors, ')" "641"
-  end_row "G-RPM-4 the config is the difference between 26 errors and 0 (--file cannot load it)"
+  # The literal error count is deliberately NOT asserted: it is a function of T1's list content
+  # (MENOR-2 measured that a one-line deps.txt edit reddened a "26 errors" row although nothing
+  # about rpmlint or the config had changed). The behaviour that matters -- errors without the
+  # config, none with it -- is asserted instead, and the config's own content guard is `filters=7`.
+  sa "without the config rpmlint reports errors (not 0) and exits 64 -- the config is load-bearing" \
+    "$(rc rpmlint-nocfg)$(num rpmlint-nocfg.txt ' 0 errors, ')" "640"
+  sa "and PLAN 10.3's literal --file does NOT load this TOML (same shape: rc 64, errors)" \
+    "$(rc rpmlint-file)$(num rpmlint-file.txt ' 0 errors, ')" "640"
+  sa "while with the config the same two packages report 0 errors and exit 0" \
+    "$(rc rpmlint-cfg)$(num rpmlint-cfg.txt ' 0 errors, ')" "01"
+  end_row "G-RPM-4 the config is the difference between errors-on and 0 errors (--file cannot load it)"
 
-  if command -v python3 >/dev/null 2>&1; then
-    # every filter must still match something, and together they must explain every error the
-    # no-config run reports: a dead filter would be a lie in the config, and an unexplained error
-    # would mean the config passes by luck.
-    python3 - "$O/rpmlint-config.toml" "$O/rpmlint-nocfg.txt" > "$O/filters.txt" 2>&1 <<'PY'
-import re, sys, tomllib
-cfg = tomllib.load(open(sys.argv[1], 'rb'))
-lines = [l for l in open(sys.argv[2], encoding='utf-8', errors='replace').read().splitlines() if ': E: ' in l]
-filters = cfg.get('Filters', [])
-dead = [f for f in filters if not any(re.search(f, l) for l in lines)]
-unexplained = [l for l in lines if not any(re.search(f, l) for f in filters)]
-print("filters=%d" % len(filters))
-print("dead=%d" % len(dead))
-print("errors=%d" % len(lines))
-print("unexplained=%d" % len(unexplained))
-for l in dead:
-    print("DEAD: " + l)
-for l in unexplained:
-    print("UNEXPLAINED: " + l)
-PY
-    sa "the config carries 8 filters, one reason each" "$(num filters.txt '^filters=8$')" "1"
+  if [ "$(rc filters)" = 0 ]; then
+    # the analysis ran in the container (there is no host-python3 dependency any more, MENOR-6);
+    # every filter must still match something and together they must explain every error.
+    sa "the config carries 7 filters, one reason each (the of-record list, R2)" "$(num filters.txt '^filters=7$')" "1"
     sa "no dead filter (each matches >=1 message of the no-config run)" "$(num filters.txt '^dead=0$')" "1"
-    sa "and the filters explain every one of the 26 errors" "$(num filters.txt '^unexplained=0$')" "1"
-    sa "the no-config run reports 26 errors, i.e. all of them" "$(num filters.txt '^errors=26$')" "1"
-    end_row "G-RPM-4 every filter is load-bearing (8 filters explain all 26 errors, none dead)"
+    sa "and the filters explain every error of the no-config run (0 unexplained)" "$(num filters.txt '^unexplained=0$')" "1"
+    sa "the no-config run does report errors for the config to explain" "$(num filters.txt '^errors=[1-9][0-9]*$')" "1"
+    end_row "G-RPM-4 every filter is load-bearing (7 filters explain every no-config error, none dead)"
   else
-    sk "no host python3: the per-filter dead-filter check did not run"
+    sk "the image had no python3: the per-filter analysis did not run"
     sa "rpmlint.toml lists its filters" "$(num rpmlint-config.toml '^Filters = \[')" "1"
-    end_row "G-RPM-4 rpmlint.toml lists filters (dead-filter check skipped: no host python3)"
+    end_row "G-RPM-4 rpmlint.toml lists filters (dead-filter check skipped: no python3 in the image)"
   fi
 fi
 
@@ -809,8 +1000,8 @@ sa "the switch OFF produces no such requirement" \
 sa "and both witness builds succeeded" "$(rc witness-no)$(rc witness-yes)" "00"
 end_row "G-RPM-5 C11 witness: the sonotype is absent under AutoReqProv: no"
 
-sa "the launcher (a #!/usr/bin/sh script, autoreq left ON) DOES get the auto interp require" \
-  "$(depauto deptypes-launcher.txt /usr/bin/sh)" "1"
+sa "the launcher (a #!/bin/sh script, autoreq left ON) DOES get the auto interp require" \
+  "$(interpdep deptypes-launcher.txt)" "1"
 sa "while the runtime's requirement set has no auto entry at all (C11's deviation is effective)" \
   "$(depauto deptypes-runtime.txt)" "0"
 sa "the sweep covers every file under the staged root" \

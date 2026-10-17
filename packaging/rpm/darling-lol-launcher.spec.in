@@ -51,11 +51,13 @@ Install darling-lol first (or at the same time): this package requires it.
 %install
 rm -rf %{buildroot}
 mkdir -p %{buildroot}
-tar -xp --numeric-owner -Jf %{SOURCE0} -C %{buildroot}
+# C50: `-I zstd -f`, not `-Jf` (same measured reason as darling-lol.spec.in: `-J` is xz, Source0 is
+# a .tar.zst; `-I zstd` reads both flavours, `-J` only its own).
+tar -xp --numeric-owner -I zstd -f %{SOURCE0} -C %{buildroot}
 install -D -m 0644 %{SOURCE2} %{buildroot}%{_docdir}/%{name}/copyright
 install -D -m 0644 %{SOURCE3} %{buildroot}%{_docdir}/%{name}/BUILD-INFO.txt
 
-# %files -f %{SOURCE1} is the launcher list produced by packaging/common/stage.sh step 4
+# %files -f %%{SOURCE1} is the launcher list produced by packaging/common/stage.sh step 4
 # (`/usr/bin/darling-lol`, `/usr/lib/darling-lol/**`, `/usr/share/doc/darling-lol/**` -- the last
 # one keeps the fork's own README-packaging.md, which is why this package owns it and the runtime
 # does not: the runtime's list is stage.sh's `files.runtime`, i.e. files.all minus files.launcher).
@@ -63,3 +65,8 @@ install -D -m 0644 %{SOURCE3} %{buildroot}%{_docdir}/%{name}/BUILD-INFO.txt
 %defattr(-,root,root,-)
 %doc %{_docdir}/%{name}/copyright
 %doc %{_docdir}/%{name}/BUILD-INFO.txt
+
+# C54: one %%changelog entry, like the runtime: without it rpmlint reports E: no-changelogname-tag
+# and rpmbuild has no source date to take (see darling-lol.spec.in for the full reason). The date is
+# pinned from the source by build-rpm.sh, never from the clock.
+@RPM_CHANGELOG@

@@ -13,8 +13,20 @@
 # this file. `Filters` is a list of regexes, merged (appended) onto the Fedora defaults.
 #
 # Every entry below is load-bearing: `rpmlint` reports "N filtered, M unused" and the G-RPM-4 gate
-# asserts the unused count is 0, so a filter that stops applying (e.g. because a %changelog was
-# added back) turns the gate red instead of rotting here silently.
+# asserts the unused count is 0 AND that together the filters explain every error of the no-config
+# run -- so a filter that stops applying, or an error no filter covers, turns the gate red instead
+# of rotting here silently.
+#
+# This list has already collected on that rule once: `no-changelogname-tag` was here while the specs
+# deliberately had no %changelog, and adding the %changelog (PLAN C54, which also gives the rpm a
+# pinned source date) made it a DEAD filter -- so it is deleted, exactly as the gate's `dead = 0`
+# row demands. A config is a list of accepted truths, not a list of red things.
+#
+# Plan feedback, deliberately not "fixed" here: PLAN Q13 recommends four filters, measured against a
+# fixture whose error set differs from this one's. These seven are the of-record list -- the entries
+# the gate actually forces against the T1 fixture (measured: 0 dead, 0 unexplained, and `no-binary`
+# is NOT filtered, per Q13's warning, because it fires only for the fixture's stub payload while on
+# a real build it would name a genuine catastrophe).
 Filters = [
     # rpmlint presumes automatic dependency generation and treats an explicit "Requires: <lib>"
     # as a mistake. AutoReqProv is deliberately OFF here (PLAN 10.1, C11): the auto-scanner would
@@ -30,9 +42,11 @@ Filters = [
     # exempts instead of the tag, so a host binary readelf cannot parse is still reported, and the
     # G-RPM-4 gate asserts this filter matches >=1 message (unused filters fail the gate).
     'readelf-failed /usr/libexec/darling/',
-    # /usr/bin/darling is setuid root on purpose: the CLI starts the container as root and drops
-    # privileges. Upstream overrides the same lintian tag (PLAN 9.6); rpm needs the bit in
-    # metadata (%attr(4755,root,root)) and this is the check that notices it exists.
+    # /usr/bin/darling is set-user-ID root on purpose: the CLI starts the container as root and drops
+    # privileges. Upstream overrides the same lintian tag (PLAN 9.6); rpm needs the bit in metadata
+    # (%attr(4755,root,root) in the generated file list, Source1) and this is the check that
+    # notices it exists. The description spells it set-user-ID, so the word alone is no longer an
+    # error -- only the mode is, and it is the deliberate one.
     'setuid-binary /usr/bin/darling',
     # The guest's usr/bin/write is 2755 setgid in the payload and must stay that way (PLAN 13.1:
     # nothing in the chain normalises modes inside libexec/darling).
@@ -41,12 +55,10 @@ Filters = [
     # the deliberate values, named here per path so any *other* odd mode is still an error.
     'non-standard-executable-perm /usr/bin/darling 4755',
     'non-standard-executable-perm /usr/libexec/darling/usr/bin/write 2755',
-    # There is deliberately no %changelog (PLAN 10.1): rpmbuild does not require one, and this
-    # project ships /usr/share/doc/darling-lol/BUILD-INFO.txt instead, with commit, inputs and
-    # provenance. Add a %changelog and this filter becomes unused -- which the gate reports.
-    'no-changelogname-tag',
-    # Technical terms the Fedora dictionary lacks: "setuid"/"setgid" (POSIX modes) and
-    # "darlingserver"/"darling-coredump" (this project's own binary names) in the descriptions.
-    # Same technique and same list as /etc/xdg/rpmlint/fedora.toml:302, which is additive here.
-    "spelling-error.* (setuid|setgid|darlingserver|coredump|darling|mldr|Mach-O|noarch)",
+    # Technical terms the Fedora dictionary lacks. Only ONE is left and it is unavoidable:
+    # "coredump" is the shipped binary's own name (darling-coredump). "setuid" used to be here too;
+    # it is gone because the %description now spells it "set-user-ID" (PLAN C54), so a filter for it
+    # would be dead -- this is the same narrowing Q13 asks for, arrived at by removing the error
+    # instead of hiding it. Same technique as /etc/xdg/rpmlint/fedora.toml:302, additive here.
+    'spelling-error.* coredump',
 ]
