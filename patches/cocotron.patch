@@ -1081,6 +1081,60 @@ index 6c3d2688..2a7d078a 100644
  + (NSArray<NSRunningApplication *> *) runningApplicationsWithBundleIdentifier: (NSString *) bundleIdentifier {
      printf("STUB %s\n", __PRETTY_FUNCTION__);
      return [NSArray array];
+diff --git a/AppKit/NSSavePanel.subproj/NSSavePanel.m b/AppKit/NSSavePanel.subproj/NSSavePanel.m
+index 50c3d59e..5872e594 100644
+--- a/AppKit/NSSavePanel.subproj/NSSavePanel.m
++++ b/AppKit/NSSavePanel.subproj/NSSavePanel.m
+@@ -124,8 +124,48 @@ static NSSavePanel *_newPanel = nil;
+     [NSApp stopModalWithCode: NSCancelButton];
+ }
+ 
++// Electron (Riot Client UI) opens its file dialogs through these and waits
++// for the handler; run the panel modally and report the result.
+ - (void) beginWithCompletionHandler: (void (^)(NSModalResponse result)) handler {
+-    NSUnimplementedMethod();
++    NSModalResponse result = [self runModal];
++    if (handler)
++        handler(result);
++}
++
++- (void) beginSheetModalForWindow: (NSWindow *) window
++                completionHandler: (void (^)(NSModalResponse result)) handler
++{
++    [self beginWithCompletionHandler: handler];
++}
++
++// Electron sets these unconditionally; Cocotron's panel has no tag field,
++// name label or extension toggle, so they are accepted and ignored.
++- (void) setNameFieldLabel: (NSString *) label {
++}
++
++- (NSString *) nameFieldLabel {
++    return nil;
++}
++
++- (void) setShowsTagField: (BOOL) flag {
++}
++
++- (BOOL) showsTagField {
++    return NO;
++}
++
++- (void) setExtensionHidden: (BOOL) flag {
++}
++
++- (BOOL) isExtensionHidden {
++    return NO;
++}
++
++- (void) setCanSelectHiddenExtension: (BOOL) flag {
++}
++
++- (BOOL) canSelectHiddenExtension {
++    return NO;
+ }
+ 
+ - (NSInteger) runModalForDirectory: (NSString *) directory
 diff --git a/AppKit/NSScreen.m b/AppKit/NSScreen.m
 index 5ca58772..54b60ef5 100644
 --- a/AppKit/NSScreen.m
@@ -2085,7 +2139,7 @@ index d545120a..b2845478 100644
  
  + (BOOL) allowsAutomaticWindowTabbing {
 diff --git a/AppKit/NSWorkspace.m b/AppKit/NSWorkspace.m
-index ad5e4f9d..dbd997aa 100644
+index ad5e4f9d..6e9cb1c9 100644
 --- a/AppKit/NSWorkspace.m
 +++ b/AppKit/NSWorkspace.m
 @@ -20,9 +20,58 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
@@ -2147,7 +2201,7 @@ index ad5e4f9d..dbd997aa 100644
  NSString *const NSWorkspaceWillPowerOffNotification =
          @"NSWorkspaceWillPowerOffNotification";
  
-@@ -161,6 +210,24 @@ NSNotificationName NSWorkspaceWillUnmountNotification = @"NSWorkspaceWillUnmount
+@@ -161,6 +210,41 @@ NSNotificationName NSWorkspaceWillUnmountNotification = @"NSWorkspaceWillUnmount
      return 0;
  }
  
@@ -2169,10 +2223,27 @@ index ad5e4f9d..dbd997aa 100644
 +    });
 +}
 +
++/* Electron's shell.openExternal({activate: false}) (Riot's "Sign in with Google") uses this
++ * pre-10.15 form. Launch options and the bundle identifier are ignored: the host decides
++ * which application opens the URL. */
++- (BOOL) openURLs: (NSArray *) urls
++        withAppBundleIdentifier: (NSString *) bundleIdentifier
++                        options: (NSUInteger) options
++ additionalEventParamDescriptor: (NSAppleEventDescriptor *) descriptor
++              launchIdentifiers: (NSArray **) identifiers
++{
++    BOOL opened = [urls count] > 0;
++    for (NSURL *url in urls)
++        opened = [self openURL: url] && opened;
++    if (identifiers != NULL)
++        *identifiers = nil;
++    return opened;
++}
++
  - (BOOL) selectFile: (NSString *) path
          inFileViewerRootedAtPath: (NSString *) rootedAtPath
  {
-@@ -317,16 +384,3 @@ NSNotificationName NSWorkspaceWillUnmountNotification = @"NSWorkspaceWillUnmount
+@@ -317,16 +401,3 @@ NSNotificationName NSWorkspaceWillUnmountNotification = @"NSWorkspaceWillUnmount
  }
  
  @end
@@ -5675,6 +5746,29 @@ index c577764b..d8bb21cc 100644
 +- (BOOL) activateWithOptions: (NSUInteger) options;
  
  @end
+diff --git a/AppKit/include/AppKit/NSSavePanel.h b/AppKit/include/AppKit/NSSavePanel.h
+index 53bacc46..3c6adfb7 100644
+--- a/AppKit/include/AppKit/NSSavePanel.h
++++ b/AppKit/include/AppKit/NSSavePanel.h
+@@ -88,6 +88,18 @@ enum {
+ - (void) setPrompt: (NSString *) message;
+ - (NSString *) prompt;
+ 
++- (void) setNameFieldLabel: (NSString *) label;
++- (NSString *) nameFieldLabel;
++- (void) setShowsTagField: (BOOL) flag;
++- (BOOL) showsTagField;
++- (void) setExtensionHidden: (BOOL) flag;
++- (BOOL) isExtensionHidden;
++- (void) setCanSelectHiddenExtension: (BOOL) flag;
++- (BOOL) canSelectHiddenExtension;
++
++- (void) beginSheetModalForWindow: (NSWindow *) window
++                completionHandler: (void (^)(NSModalResponse result)) handler;
++
+ - (void) beginSheetForDirectory: (NSString *) path
+                            file: (NSString *) name
+                  modalForWindow: (NSWindow *) docWindow
 diff --git a/AppKit/include/AppKit/NSScrubberItemView.h b/AppKit/include/AppKit/NSScrubberItemView.h
 index 40042c89..37c1f4b6 100644
 --- a/AppKit/include/AppKit/NSScrubberItemView.h
