@@ -6257,7 +6257,7 @@ index deca16b87..d75d5e22d 100644
  
  set_property(TARGET OpenGL APPEND_STRING PROPERTY LINK_FLAGS
 diff --git a/src/frameworks/OpenGL/OpenGL.c b/src/frameworks/OpenGL/OpenGL.c
-index ffd7fe054..1ff212d34 100644
+index ffd7fe054..1536c8c4b 100644
 --- a/src/frameworks/OpenGL/OpenGL.c
 +++ b/src/frameworks/OpenGL/OpenGL.c
 @@ -2,11 +2,22 @@
@@ -6527,9 +6527,23 @@ index ffd7fe054..1ff212d34 100644
  
      if (surface == EGL_NO_SURFACE) {
          return NULL;
-@@ -171,14 +309,18 @@ CGLWindowRef CGLGetWindow(void *native_window) {
+@@ -170,15 +308,55 @@ CGLWindowRef CGLGetWindow(void *native_window) {
+     return (CGLWindowRef) surface;
  }
  
++/* X visual of the config CGLGetWindow surfaces use, or 0 when unknown.
++ * NVIDIA rejects a window whose visual differs from the config's
++ * (EGL_BAD_CONFIG); Mesa accepts it. Windows meant for CGLGetWindow must be
++ * created with this visual. */
++CGL_EXPORT unsigned long CGLGetNativeVisualID(void) {
++    EGLint visual = 0;
++    if (display == EGL_NO_DISPLAY || config == NULL || !p_eglGetConfigAttrib)
++        return 0;
++    if (!p_eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &visual))
++        return 0;
++    return (unsigned long) visual;
++}
++
  CGL_EXPORT void CGLDestroyWindow(CGLWindowRef window) {
 -    eglDestroySurface(display, (EGLSurface) window);
 +    p_eglDestroySurface(display, (EGLSurface) window);
@@ -6542,13 +6556,36 @@ index ffd7fe054..1ff212d34 100644
      context->egl_surface = (EGLSurface) window;
 -    return CGLSetCurrentContext(context);
 +    CGLError result = CGLSetCurrentContext(context);
-+    if (result != kCGLNoError)
++    if (result != kCGLNoError) {
 +        context->egl_surface = oldSurface;
-+    return result;
++        return result;
++    }
++    /* A context first made current without a surface keeps GL_NONE as its
++     * default framebuffer's draw and read buffers. NVIDIA applies this even
++     * after a window surface is attached, so everything drawn to the window was
++     * discarded (black window); Mesa resets the buffers on attach. */
++    if (window != NULL && (EGLSurface) window != oldSurface) {
++        GLint drawFramebuffer = 0, readFramebuffer = 0, drawBuffer = GL_BACK, readBuffer = GL_BACK;
++        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
++        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
++        if (drawFramebuffer != 0 || readFramebuffer != 0)
++            glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        glGetIntegerv(GL_DRAW_BUFFER, &drawBuffer);
++        glGetIntegerv(GL_READ_BUFFER, &readBuffer);
++        if (drawBuffer == GL_NONE)
++            glDrawBuffer(GL_BACK);
++        if (readBuffer == GL_NONE)
++            glReadBuffer(GL_BACK);
++        if (drawFramebuffer != 0 || readFramebuffer != 0) {
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebuffer);
++        }
++    }
++    return kCGLNoError;
  }
  
  static pthread_key_t current_context_key;
-@@ -198,18 +340,42 @@ CGLContextObj CGLGetCurrentContext(void) {
+@@ -198,18 +376,42 @@ CGLContextObj CGLGetCurrentContext(void) {
      return pthread_getspecific(key);
  }
  
@@ -6596,7 +6633,7 @@ index ffd7fe054..1ff212d34 100644
  }
  
  CGLError CGLSetFullScreen(CGLContextObj ctx) {
-@@ -223,11 +389,13 @@ CGLError CGLChoosePixelFormat(
+@@ -223,11 +425,13 @@ CGLError CGLChoosePixelFormat(
      CGLPixelFormatObj *result,
      GLint *number_of_screens
  ) {
@@ -6611,7 +6648,7 @@ index ffd7fe054..1ff212d34 100644
      for (int i = 0; i < count; i++) {
          format->attributes[i] = attrs[i];
      }
-@@ -251,6 +419,10 @@ CGLError CGLDescribePixelFormat(
+@@ -251,6 +455,10 @@ CGLError CGLDescribePixelFormat(
      CGLPixelFormatAttribute attr,
      GLint *value
  ) {
@@ -6622,7 +6659,7 @@ index ffd7fe054..1ff212d34 100644
      for (int i = 0; format->attributes[i] != 0; i++) {
          int has_arg = attribute_has_argument(format->attributes[i]);
  
-@@ -304,24 +476,67 @@ GLuint CGLGetPixelFormatRetainCount(CGLPixelFormatObj pixelFormat) {
+@@ -304,24 +512,67 @@ GLuint CGLGetPixelFormatRetainCount(CGLPixelFormatObj pixelFormat) {
  }
  
  CGLError CGLCreateContext(CGLPixelFormatObj pixelFormat, CGLContextObj share, CGLContextObj *resultp) {
@@ -6691,7 +6728,7 @@ index ffd7fe054..1ff212d34 100644
  
      *resultp = context;
  
-@@ -333,7 +548,7 @@ CGLContextObj CGLRetainContext(CGLContextObj context) {
+@@ -333,7 +584,7 @@ CGLContextObj CGLRetainContext(CGLContextObj context) {
          return NULL;
      }
  
@@ -6700,7 +6737,7 @@ index ffd7fe054..1ff212d34 100644
      return context;
  }
  
-@@ -342,11 +557,17 @@ void CGLReleaseContext(CGLContextObj context) {
+@@ -342,11 +593,17 @@ void CGLReleaseContext(CGLContextObj context) {
          return;
      }
  
@@ -6721,7 +6758,7 @@ index ffd7fe054..1ff212d34 100644
  
      if (CGLGetCurrentContext() == context) {
          CGLSetCurrentContext(NULL);
-@@ -354,7 +575,11 @@ void CGLReleaseContext(CGLContextObj context) {
+@@ -354,7 +611,11 @@ void CGLReleaseContext(CGLContextObj context) {
  
      pthread_mutex_destroy(&(context->lock));
  
@@ -6734,7 +6771,7 @@ index ffd7fe054..1ff212d34 100644
  
      free(context);
  }
-@@ -383,9 +608,330 @@ CGLError CGLUnlockContext(CGLContextObj context) {
+@@ -383,9 +644,330 @@ CGLError CGLUnlockContext(CGLContextObj context) {
      return kCGLNoError;
  }
  
@@ -7067,7 +7104,7 @@ index ffd7fe054..1ff212d34 100644
  }
  
  CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, const GLint *value) {
-@@ -394,8 +940,9 @@ CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, c
+@@ -394,8 +976,9 @@ CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, c
  
      if (parameter == kCGLCPSwapInterval)
      {
@@ -7078,7 +7115,7 @@ index ffd7fe054..1ff212d34 100644
          if (success)
              context->swap_interval = v;
          return success ? kCGLNoError : kCGLBadValue;
-@@ -417,14 +964,19 @@ CGLError CGLGetParameter(CGLContextObj context, CGLContextParameter parameter, G
+@@ -417,14 +1000,19 @@ CGLError CGLGetParameter(CGLContextObj context, CGLContextParameter parameter, G
      return kCGLNoError;
  }
  
@@ -7104,6 +7141,18 @@ index ffd7fe054..1ff212d34 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h b/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h
+index 1d0b10e65..7f5e2d963 100644
+--- a/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h
++++ b/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h
+@@ -15,6 +15,7 @@ CGL_EXPORT CGLError CGLRegisterNativeDisplay(void *native_display);
+ 
+ CGL_EXPORT CGLWindowRef CGLGetWindow(void *native_window);
+ CGL_EXPORT void CGLDestroyWindow(CGLWindowRef window);
++CGL_EXPORT unsigned long CGLGetNativeVisualID(void);
+ 
+ CGL_EXPORT CGLError CGLContextMakeCurrentAndAttachToWindow(CGLContextObj context, CGLWindowRef window);
+ CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid);
 diff --git a/src/frameworks/OpenGL/include/OpenGL/CGLTypes.h b/src/frameworks/OpenGL/include/OpenGL/CGLTypes.h
 index 7d5eda01a..803ac02d3 100644
 --- a/src/frameworks/OpenGL/include/OpenGL/CGLTypes.h

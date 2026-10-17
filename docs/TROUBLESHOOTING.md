@@ -186,7 +186,7 @@ On Hyprland, also check that direct scanout is off (`hyprctl getoption render:di
 
 ## Hybrid graphics laptops (AMD/Intel iGPU + NVIDIA)
 
-Metal renders with Vulkan, and each finished frame is handed to an OpenGL (EGL) context that presents it. The hand-off uses opaque file descriptors, which only work when Vulkan and OpenGL run on the same GPU. Indium takes the first Vulkan device the loader lists, and on a hybrid laptop both that device and the EGL context are normally the integrated GPU, so the discrete GPU stays idle. A report in [issue #3](https://github.com/lucannez64/darling-lol/issues/3) (Ryzen 9 5900HS, RTX 3060 Laptop) measured 60-70 FPS in ARAM on the integrated GPU; on the NVIDIA GPU the game showed a black screen. **Running on an NVIDIA GPU is not validated.**
+Metal renders with Vulkan, and each finished frame is handed to an OpenGL (EGL) context that presents it. The hand-off uses opaque file descriptors, which only work when Vulkan and OpenGL run on the same GPU. Indium takes the first Vulkan device the loader lists, and on a hybrid laptop both that device and the EGL context are normally the integrated GPU, so the discrete GPU stays idle. A report in [issue #3](https://github.com/lucannez64/darling-lol/issues/3) (Ryzen 9 5900HS, RTX 3060 Laptop) measured 60-70 FPS in ARAM on the integrated GPU; on the NVIDIA GPU the game showed a black screen. On a single-GPU NVIDIA desktop the game now runs; see [NVIDIA proprietary driver](#nvidia-proprietary-driver) for what changed and what is still limited.
 
 ### Run on the discrete GPU
 
@@ -233,6 +233,13 @@ The first import of a drawable into the presenting OpenGL context, and the first
 A non-zero error or `FAILED` means the frames cannot reach the window. Before 2026-10-16 the import did not mark the memory as dedicated, which the extension requires; Mesa ignores it, and it is the suspected cause of the NVIDIA black screen (not yet confirmed). An NVIDIA log of 2026-10-16 showed `glTiling=optimal` with `setup_error=0x501 storage_error=0x501 FAILED`: NVIDIA's GL rejects `GL_LINEAR_TILING_EXT`, so the linear Vulkan image could not be imported. Since then the internal image and the GL texture use optimal tiling when `GL_VENDOR` contains NVIDIA (`vkTiling=optimal glTiling=optimal ok` is the expected line); everything else keeps linear. If the game shows a black screen on NVIDIA, report it with this file.
 
 An additional NVIDIA report on `68f816d` showed successful optimal-tiling import but repeated `Metal Device timed out giving us a Drawable to present` messages. Its [presentation trace](https://github.com/lucannez64/darling-lol/issues/3#issuecomment-6214732591) shows all three drawables queued and all three main-thread presentation callbacks running, followed by timeouts with three frames still queued. The compositor only prepared a Metal layer when it was the root layer, skipping nested Metal layers. It now prepares Metal layers throughout the tree. A standalone nested-layer reproduction exhausts the pool before this correction and passes ten presentations with pixel readback after it; the root-layer probe also passes. Confirmation on the reporter's NVIDIA system is still needed.
+
+### NVIDIA proprietary driver
+
+Exercised on a single-GPU RTX 3060 desktop (driver 615.71, sway with Xwayland), playing custom matches. The client window still needs `RCLOL_GPU_DIRECT_PRESENT=0`: the direct GPU path reports no error, but its window stays black.
+
+- **Black game window, surface.** The compositor subwindow inherited its parent's GLX visual, and NVIDIA's EGL refuses a window surface for a config with another visual (`EGL_BAD_CONFIG`); Mesa accepts the mismatch. The subwindow is now created with the visual of CGL's EGL config (`CGLGetNativeVisualID`).
+- **Black game window, drawing.** The compositor context is first made current without a surface, so its default framebuffer kept `GL_NONE` as draw buffer after a window surface was attached, and NVIDIA discarded every composite. Attaching a new window surface now restores `GL_BACK`. `riot-metal-presentation-check` with `RIOT_PRESENTATION_HOLD=<seconds>` keeps presenting, so the window's real pixels can be read from the host.
 
 ### Host-side checks
 

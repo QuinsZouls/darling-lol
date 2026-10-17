@@ -4472,6 +4472,88 @@ index 0000000..31fa646
 +}
 +
 +#endif
+diff --git a/AppKit/X11.backend/X11SubWindow.h b/AppKit/X11.backend/X11SubWindow.h
+index 65b63a3e..f9fcd115 100644
+--- a/AppKit/X11.backend/X11SubWindow.h
++++ b/AppKit/X11.backend/X11SubWindow.h
+@@ -7,6 +7,7 @@
+     X11Window *_parent;
+     Display *_display;
+     Window _window;
++    Colormap _colormap;
+ }
+ 
+ - initWithParentWindow: (X11Window *) parent frame: (CGRect) frame;
+diff --git a/AppKit/X11.backend/X11SubWindow.m b/AppKit/X11.backend/X11SubWindow.m
+index 738ab457..7eb601e8 100644
+--- a/AppKit/X11.backend/X11SubWindow.m
++++ b/AppKit/X11.backend/X11SubWindow.m
+@@ -1,6 +1,11 @@
+ #import "X11SubWindow.h"
+ #import "X11Display.h"
+ #import "X11Window.h"
++#import <X11/Xutil.h>
++#import <OpenGL/CGLInternal.h>
++
++// Weak so this backend still loads with an older OpenGL overlay.
++extern unsigned long CGLGetNativeVisualID(void) __attribute__((weak_import));
+ 
+ @implementation X11SubWindow
+ 
+@@ -20,11 +25,39 @@
+ 
+     _display = [(X11Display *) [NSDisplay currentDisplay] display];
+ 
+-    _window = XCreateSimpleWindow(_display, [parent windowHandle],
+-                                  frame.origin.x, frame.origin.y,
+-                                  frame.size.width, frame.size.height, 0, 0,
+-                                  0 /* border_width, border, background */
+-    );
++    // The subwindow hosts the CGL surface of the layer compositor, so it must
++    // use the visual of CGL's EGL config: NVIDIA refuses to create a surface
++    // for a window with any other visual. The parent's GLX visual usually
++    // differs and may have no EGL config at all.
++    XVisualInfo *visualInfo = NULL;
++    XVisualInfo template;
++    int matched = 0;
++    template.visualid = CGLGetNativeVisualID ? CGLGetNativeVisualID() : 0;
++    if (template.visualid != 0)
++        visualInfo = XGetVisualInfo(_display, VisualIDMask, &template, &matched);
++
++    if (visualInfo != NULL) {
++        XSetWindowAttributes attributes;
++        _colormap = XCreateColormap(_display, [parent windowHandle],
++                                    visualInfo->visual, AllocNone);
++        attributes.colormap = _colormap;
++        attributes.border_pixel = 0;
++        attributes.background_pixel = 0;
++        _window = XCreateWindow(_display, [parent windowHandle],
++                                frame.origin.x, frame.origin.y,
++                                frame.size.width, frame.size.height, 0,
++                                visualInfo->depth, InputOutput,
++                                visualInfo->visual,
++                                CWColormap | CWBorderPixel | CWBackPixel,
++                                &attributes);
++        XFree(visualInfo);
++    } else {
++        _window = XCreateSimpleWindow(_display, [parent windowHandle],
++                                      frame.origin.x, frame.origin.y,
++                                      frame.size.width, frame.size.height, 0, 0,
++                                      0 /* border_width, border, background */
++        );
++    }
+ 
+     [self show];
+     return self;
+@@ -32,6 +65,8 @@
+ 
+ - (void) dealloc {
+     XDestroyWindow(_display, _window);
++    if (_colormap != None)
++        XFreeColormap(_display, _colormap);
+     [super dealloc];
+ }
+ 
 diff --git a/AppKit/X11.backend/X11Window.h b/AppKit/X11.backend/X11Window.h
 index bfe3839a..e8c8828f 100644
 --- a/AppKit/X11.backend/X11Window.h
