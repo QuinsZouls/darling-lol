@@ -1,0 +1,28 @@
+# Lintian overrides for darling-lol-launcher -- shipped as
+# /usr/share/lintian/overrides/darling-lol-launcher.
+#
+# Same policy as darling-lol.lintian-overrides (read the header there): only tags the gate's
+# lintian knows, and only content classes PLAN 9.6 accepts.
+#
+# The launcher package is text: /usr/bin/darling-lol (a shell wrapper) and ~190 unrendered
+# templates under /usr/lib/darling-lol/{scripts,tools}/, which between them carry
+# #!/usr/bin/env bash, #!/usr/bin/env python3 and #!/bin/sh shebangs, .py/.sh language extensions
+# and (deliberately) a few non-executable .in templates. "Fixing" them would mean rewriting the
+# templates, which are staged byte-for-byte from packaging/install/ by T8.
+#
+# Three names PLAN 9.6's launcher list carries are unknown to the gate's lintian (v2.117.0ubuntu1.5)
+# and are therefore NOT here -- each would be "E: alien-tag": no-shebang, non-executable-script,
+# example-interpreter-not-in-package. One of them has an exact counterpart under a name this lintian
+# uses, and it is carried over under that name:
+script-not-executable *
+#   (2.117's own text: "This file starts with the #! sequence that marks interpreted scripts, but it
+#   is not executable" -- severity warning. The other two have no counterpart: grep finds no tag
+#   whose name or explanation matches "a script with no shebang at all", and the templates' shebangs
+#   name /usr/bin/env, so nothing is missing from the launcher's Depends. See report finding F9.)
+
+# NOT MEASURED HERE (the fixture's launcher is one 2-line wrapper and five .py files without
+# shebangs): the real payload's ~190 templates. These are the same content classes the runtime
+# package overrides.
+script-with-language-extension *
+wrong-path-for-interpreter *
+executable-not-elf-or-script *

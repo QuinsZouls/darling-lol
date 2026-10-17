@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+# On remove AND purge: drop the binfmt handlers we registered, so a removed package does not
+# leave the kernel routing Mach-O execs to a now-deleted mldr (EVIDENCE C6 -- a registered
+# handler with a missing interpreter breaks every Mach-O execve on the host).
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl restart systemd-binfmt.service >/dev/null 2>&1 || true
+    fi
+fi
+# ~/.darling and ~/.local/share/darling-lol are per-user state and are NEVER touched here (N5).
+exit 0

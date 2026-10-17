@@ -1,0 +1,15 @@
+Package: darling-lol-launcher
+Version: @VERSION@
+Section: contrib/otherosfs
+Priority: optional
+Architecture: all
+Maintainer: darling-lol maintainers <@MAINTAINER@>
+Homepage: https://github.com/QuinsZouls/darling-lol
+Depends: darling-lol (= ${binary:Version}), python3 (>= 3.8)
+Installed-Size: @LAUNCHER_INSTALLED_SIZE@
+Description: per-user launcher for the darling-lol runtime
+ Ships the unrendered templates under /usr/lib/darling-lol and the
+ darling-lol(1) wrapper, which renders them into
+ ~/.local/share/darling-lol for the invoking user (host home, guest
+ user, guest home and SDK path are per-user, so they cannot be baked
+ into a system package) and then starts the Riot client.

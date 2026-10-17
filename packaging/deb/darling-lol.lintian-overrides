@@ -1,0 +1,80 @@
+# Lintian overrides for darling-lol -- shipped as /usr/share/lintian/overrides/darling-lol.
+#
+# Policy of this file (PLAN 9.6):
+#   * every line names a tag that the gate's lintian actually knows. An unknown name is
+#     "E: alien-tag" -- the override file itself fails the very gate it exists to satisfy. Five
+#     names PLAN 9.6 carries are unknown to the gate's lintian (v2.117.0ubuntu1.5, the version the
+#     brief's ubuntu:24.04 image installs): dangling-symlink, no-shebang, shebang-is-interpreter,
+#     non-executable-script, example-interpreter-not-in-package. `grep -r <name> /usr/share/lintian`
+#     finds nothing at all for any of them -- they are absent from this lintian, not renamed -- so
+#     they are not listed here. See the T3 report, finding F9.
+#   * a line is either MEASURED on the fixture package of packaging/testdata/run-deb-gates.sh
+#     (delete it and the battery's G-DEB-4 row goes red: the tag is load-bearing), or it is one of
+#     the content classes PLAN 9.6 lists for the real payload and is marked "NOT MEASURED HERE".
+#   * the error-severity tags below are content classes, not oversights: the remedy would be
+#     rewriting Apple's guest tree, and PLAN 9.6/§13.1/§13.4 accept shipping it byte-for-byte.
+#     The two error tags that are about OUR control file (Section: contrib/games and the launcher's
+#     Depends on Essential packages) are NOT overridden -- their remedy is two metadata tokens, and
+#     suppressing them instead would be the decorative override this file must not be.
+#
+# Verify a name before adding it:  lintian-explain-tags <tag>
+#   docker run --rm darling-deb-gate:24.04 bash -c \
+#     'lintian-explain-tags --list-tags | grep -x <tag> || echo ALIEN'
+
+# The guest tree is macOS-derived: 33 498 files, of which 142 are Mach-O binaries named *.so and
+# thousands are shell/perl/python/ruby scripts with #!/usr/bin/env shebangs and non-Debian
+# interpreter paths. Upstream carries the same class of overrides
+# (debian/darling.lintian-overrides at the pin). We do not patch 587 MB of guest content.
+# All of these are NOT MEASURED HERE (the fixture's guest tree is 10 files, not 33 498).
+wrong-path-for-interpreter *
+script-with-language-extension *
+executable-not-elf-or-script *
+statically-linked-binary *
+arch-dependent-file-in-usr-share *
+embedded-library *
+
+# package-contains-empty-directory is severity info, so it is invisible in the gate's output; it is
+# listed because the real payload ships empty NSLibraryDirectory entries on purpose, which is what a
+# "sometimes wanted" empty directory looks like.
+package-contains-empty-directory *
+
+# The four host ELFs carry DWARF and /home/runner build paths. Stripping is opt-in and measured
+# (PLAN 13.4); until it lands, this is a known, documented state, not an oversight. NOT MEASURED
+# HERE (the fixture's host "ELFs" are stand-ins whose header cannot be parsed).
+unstripped-binary-or-object *
+
+# PLAN 9.6 carries this line as "binary-or-shlib-defines-rpath", which lintian renamed: 2.117's
+# `/usr/share/lintian/tags/c/custom-library-search-path.tag` says "Renamed-From:
+# binary-or-shlib-defines-rpath", and the old spelling does NOT silence the new tag (measured:
+# setuid-binary below) -- so the plan's line would be inert and the real payload's RPATH error would
+# reach the gate. The payload is a macOS root filesystem whose *.so are Mach-O files linked against
+# a private runtime; a host library-search-path rule has nothing useful to say about them. NOT
+# MEASURED HERE.
+custom-library-search-path *
+
+# MEASURED on the fixture, both stand-ins (`usr/bin/write` and `libguest.bin`): the payload is
+# x86-64 by construction (C2) and the guest ships pre-built binaries, but the staged stand-ins are
+# 4-byte-magic fakes whose header can never match "amd64", so the tag fires. PLAN 9.6 lists it. It
+# is the one line here that suppresses an error tag on a condition a human might want to see, so
+# T11's payload re-measurement owns re-checking it against the real tree.
+binary-from-other-architecture *
+
+# MEASURED. /usr/bin/darling is setuid root because the runtime starts a container as root and then
+# drops privileges (PLAN 13.1), and the guest's own usr/bin/write is 2755 in macOS -- content we
+# ship byte-for-byte.
+#
+# ONE line has to cover both files, and it cannot name them. Lintian renamed this tag
+# (setuid-binary -> elevated-privileges) and turned the mode/owner into a NOTE, not a context: 2.117
+# issues the hint with no context at all, so every context-bearing spelling is inert. Measured, all
+# three forms, over the fixture: "elevated-privileges 4755 root/root" (the modernised form of PLAN
+# 9.6's "setuid-binary usr/bin/darling 4755 root/root") and "elevated-privileges [usr/bin/darling]"
+# both answer "W: mismatched-override" AND leave "W: elevated-privileges 4755 root/root" standing,
+# while "elevated-privileges *" silences both hints. The files are named here instead:
+#   usr/bin/darling                      4755 root/root   (setuid, required)
+#   usr/libexec/darling/usr/bin/write    2755 root/root   (macOS guest content, shipped as-is)
+elevated-privileges *
+
+# MEASURED. /usr/libexec/darling/Volumes/DarlingEmulatedDrive -> / is intentional (C19: the guest
+# resolves its own boot volume that way, and files.all must not walk through it -- a gate exists for
+# that). Lintian's "you can infinitely chdir with this symlink" is the same fact as a warning.
+symlink-is-self-recursive *

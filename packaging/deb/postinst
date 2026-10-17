@@ -1,0 +1,42 @@
+#!/bin/sh
+# postinst for darling-lol. Idempotent; must succeed on configure-after-failed-unpack too.
+set -e
+
+SDK=/usr/libexec/darling
+
+# 1. Assert the setuid bit survived. dpkg restores modes from data.tar, so this should never
+#    fire -- but a lost setuid bit turns every launch into a confusing permission error, and
+#    this is the cheapest place to say what actually went wrong (EVIDENCE C3).
+mode=$(stat -c '%a' /usr/bin/darling 2>/dev/null || echo missing)
+if [ "$mode" != 4755 ]; then
+    echo "darling-lol: FATAL /usr/bin/darling is mode $mode, expected 4755 (setuid root)." >&2
+    echo "darling-lol: the runtime cannot start containers without it. Reinstall, and if it" >&2
+    echo "darling-lol: persists, report the output of 'dpkg-deb -c <the .deb> | grep bin/darling'." >&2
+    exit 1
+fi
+
+# 2. Assert the real mldr exists -- the binfmt drop-in points at it (EVIDENCE C6).
+if [ ! -x "$SDK/usr/libexec/darling/mldr" ]; then
+    echo "darling-lol: FATAL $SDK/usr/libexec/darling/mldr is missing or not executable." >&2
+    exit 1
+fi
+
+# 3. Reload the binfmt handlers. systemd-binfmt reads /usr/lib/binfmt.d/*.conf; without this the
+#    new drop-in only takes effect at next boot. Never fail the install over it: binfmt_misc may
+#    be unavailable (containers, kernels without CONFIG_BINFMT_MISC) and the darling CLI does not
+#    need it -- it execs mldr directly.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl restart systemd-binfmt.service >/dev/null 2>&1 || \
+        echo "darling-lol: note: could not restart systemd-binfmt; Mach-O binfmt handlers will" \
+             "register at next boot. The darling CLI does not require them."
+fi
+
+# 4. Tell the user the next step. dpkg shows this verbatim.
+cat <<'EOF'
+darling-lol: installed. Next steps:
+  1. sudo apt install darling-lol-launcher      (if you have not already)
+  2. darling-lol                                (renders ~/.local/share/darling-lol, first run
+                                                 creates ~/.darling and takes a few minutes)
+  3. Set your Riot region when the launcher asks.
+EOF
+exit 0
