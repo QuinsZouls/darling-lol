@@ -66,6 +66,19 @@ fi
 #                        packaging/testdata/ only, so packaging/deb/ is invisible to it)
 #   binary-version       leave ${binary:Version} unsubstituted       -> the build row (render.sh
 #                        and build-deb.sh both refuse it, which is the point)
+#   launcher-zstd        build ONLY the launcher's data member -Zzstd -> the two "data member is xz"
+#                        rows (MENOR-2: the mutation the row could not catch -- `|| echo 0` corrupted
+#                        the accumulator so the row PASSed while a zstd member was present)
+#   maintainer-wrapped   put PLAN 9.1 (rev 7)'s wrapped Maintainer: back in control.in -> the
+#                        exact-Maintainer row (MENOR-1/C43-g: with a real contact the value nests),
+#                        and E: malformed-contact in the container
+#   maintainer-addressless  drop the address from build-deb.sh's OWN default -> the "the builder's
+#                        default carries an address" guard (MENOR-4/C43-g: render.sh's shared default
+#                        is still addressless, so the deb path must never rely on it)
+#   override-error-tag   delete an ERROR-severity override line (binary-from-other-architecture)
+#                        -> G-DEB-4 INSIDE the container (MENOR-3). An offline run cannot see it,
+#                        which is exactly the gap MENOR-3 names, so the control lives below with the
+#                        other container controls.
 BREAK=${T3_GATES_BREAK:-}
 KEEP=${T3_KEEP:-0}
 # T3_LINTIAN_FAILON=<level>  the container's `lintian --fail-on <level>` (default: error, the
@@ -76,6 +89,10 @@ KEEP=${T3_KEEP:-0}
 #   because nothing of the OBJECT changes there -- the measurement does.
 FAILON_LEVEL=${T3_LINTIAN_FAILON:-error}
 NO_CONTROL=${T3_NO_CONTROL:-}
+# T3_GATES_REQUIRE_DOCKER=1 turns "G-DEB-4 was SKIPped" into a FAILURE (NIT-5): a CI wiring that
+# runs this battery without T3_GATES_DOCKER=1 must not come back green with the package's only
+# policy gate never executed. Off by default, because a bare offline run cannot run lintian.
+REQUIRE_DOCKER=${T3_GATES_REQUIRE_DOCKER:-0}
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/darling-t3-deb-gates.XXXXXX")
 if [ "$KEEP" = 1 ]; then
@@ -85,6 +102,9 @@ else
 fi
 
 pass=0; fail=0; skips=0
+# dockerskip: set when the G-DEB-4 ROW is skipped, so T3_GATES_REQUIRE_DOCKER=1 can refuse a green
+# battery in which the package's only policy gate never ran (NIT-5).
+dockerskip=0
 ok()   { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 no()   { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 chk()  { if [ -z "${2:-}" ]; then no "$1: EMPTY result (command failed)"; elif [ "$2" = "$3" ]; then ok "$1 ($2)"; else no "$1: got '$2', want '$3'"; fi; }
@@ -167,15 +187,37 @@ if [ -n "$BREAK" ]; then
       # valid awk no-op instead, so the guard that is supposed to catch it is the thing that fires.
       sed -i 's/^    line = lit(line, "\${binary:Version}", tok\["@VERSION@"\])$/    line = line # T3_GATES_BREAK/' \
         "$MUT/packaging/common/render.sh" ;;
+    launcher-zstd)
+      # MENOR-2: build ONLY the launcher's data member with zstd, so the runtime row stays green and
+      # the launcher row (and the swept "no zstd member in EITHER" row) must go red -- this is the
+      # mutation that used to PASS because `|| echo 0` made the accumulator a syntax error.
+      sed -i 's|--build --root-owner-group -Zxz "$lwork"|--build --root-owner-group -Zzstd "$lwork"|' "$B" ;;
+    maintainer-wrapped)
+      # MENOR-1/C43-g: PLAN 9.1 rev 7 wrapped the token; once --maintainer carries a real contact it
+      # nests (`... <darling-lol maintainers <addr>>`). Only the exact-value row sees it offline;
+      # lintian answers it with E: malformed-contact.
+      sed -i 's|^Maintainer: @MAINTAINER@$|Maintainer: darling-lol maintainers <@MAINTAINER@>|' \
+        "$MUT/packaging/deb/control.in" ;;
+    maintainer-addressless)
+      # MENOR-4/C43-g: put the builder's own default back to the addressless shape render.sh:27
+      # still ships. The deb path is supposed to be discharged by passing its own address-bearing
+      # contact, so the guard row -- not lintian -- is what goes red.
+      sed -i 's|:-darling-lol maintainers <darling-lol@users.noreply.github.com>}|:-darling-lol maintainers}|' "$B" ;;
+    override-error-tag)
+      # MENOR-3: delete an ERROR-severity override line. F14 measured that only such a tag is
+      # load-bearing for `lintian --fail-on error`; the older `override-tag` label deletes a
+      # *warning* tag, so it proves the in-tree TEXT row, not the gate.
+      sed -i '/^binary-from-other-architecture /d' "$MUT/packaging/deb/darling-lol.lintian-overrides" ;;
     *) echo "run-deb-gates: unknown T3_GATES_BREAK='$BREAK'" >&2; exit 2 ;;
   esac
   BUILDER=$B
   # prove the mutation is real: a sed that silently matched nothing would leave the object
   # untouched and make the whole negative control vacuous.
   case $BREAK in
-    no-root-owner-group | no-copyright | conffiles) cmp -s "$B" packaging/common/build-deb.sh ;;
-    override-tag) cmp -s "$MUT/packaging/deb/darling-lol.lintian-overrides" packaging/deb/darling-lol.lintian-overrides ;;
-    games-section) cmp -s "$MUT/packaging/deb/control.in" packaging/deb/control.in ;;
+    no-root-owner-group | no-copyright | conffiles | maintainer-addressless) cmp -s "$B" packaging/common/build-deb.sh ;;
+    launcher-zstd) cmp -s "$B" packaging/common/build-deb.sh ;;
+    override-tag | override-error-tag) cmp -s "$MUT/packaging/deb/darling-lol.lintian-overrides" packaging/deb/darling-lol.lintian-overrides ;;
+    games-section | maintainer-wrapped) cmp -s "$MUT/packaging/deb/control.in" packaging/deb/control.in ;;
     essential-depends) cmp -s "$MUT/packaging/deb/launcher-control.in" packaging/deb/launcher-control.in ;;
     no-trailing-newline) cmp -s "$MUT/packaging/deb/prerm" packaging/deb/prerm ;;
     binary-version) cmp -s "$MUT/packaging/common/render.sh" packaging/common/render.sh ;;
@@ -217,7 +259,14 @@ dpkg-deb -e "$LT" "$WORK/lt.ctl.d" || true
 dpkg-deb -x "$RT" "$WORK/rt.x" || true
 dpkg-deb -x "$LT" "$WORK/lt.x" || true
 chk "both data archives extract (dpkg-deb -x)" "$([ -d "$WORK/rt.x/usr/libexec/darling" ] && [ -d "$WORK/lt.x/usr/lib/darling-lol" ] && echo 2 || echo 0)" 2
-chk "the payload carries no DEBIAN/ directory" "$(cnt ' \./DEBIAN' "$WORK/rt.list")" 0
+# NIT-1 (removed): the row that used to live here, `the payload carries no DEBIAN/ directory`,
+# counted ` \./DEBIAN` in `dpkg-deb -c`'s output. That listing is the DATA archive only, and a
+# top-level `./DEBIAN` in a payload *is* the control directory by definition, so the pattern could
+# never match: the row was unfalsifiable (no build, including one with a nested `usr/DEBIAN`, could
+# redden it). The invariant it pretended to assert -- "the control files are not in the payload" --
+# is genuinely asserted by the G-DEB-3 rows below (`dpkg-deb -e` extracts exactly
+# `control postinst postrm prerm`, and the launcher's control archive is `control` alone). The
+# review's guidance is explicit: a row that cannot fail is worse than no row.
 
 # --- G-DEB-1 ------------------------------------------------------------------------------------
 sec "G-DEB-1  dpkg-deb -c: the nine hostile shapes survive verbatim"
@@ -264,10 +313,14 @@ chk "the runtime's data member is xz (C13: zstd is unreadable on dpkg < 1.21.18)
 chk "the launcher's data member is xz" "$(grep -ac 'data\.tar\.xz' "$LT" || true)" 1
 zst=0
 for f in "$RT" "$LT"; do
-  # `|| echo 0`: grep prints NOTHING for a missing file, and an empty operand in $(( )) is a bash
-  # syntax error -- which, in a non-interactive shell, aborts the whole battery (measured: the
-  # binary-version mutation used to kill the run one row before SUMMARY).
-  zst=$((zst + $(grep -ac 'data\.tar\.zst' "$f" || echo 0)))
+  # MENOR-2: `|| true`, NOT `|| echo 0`. `grep -c` prints `0` and *exits 1* when the file exists
+  # with no match (it prints nothing only when the FILE is missing), so `|| echo 0` appended a
+  # second line and the operand became `"0\n0"` -- a bash arithmetic syntax error on every run,
+  # which silently pinned $zst to 0 and left this row blind to a zstd member. `|| true` keeps the
+  # printed `0` and swallows the status. (Measured before the fix: `line N: zst + 0\n0: syntax
+  # error in expression`; and a launcher-only `-Zzstd` build PASSed this row while carrying the
+  # member -- now `T3_GATES_BREAK=launcher-zstd` turns it red, see the control section.)
+  zst=$((zst + $(grep -ac 'data\.tar\.zst' "$f" || true)))
 done
 chk "no zstd data member in either package" "$zst" 0
 
@@ -293,7 +346,16 @@ chk "runtime Version == pkg-version.sh --deb $TAG" "$(dpkg-deb -f "$RT" Version 
 chk "launcher Version == the same" "$(dpkg-deb -f "$LT" Version 2>/dev/null)" "$VERSION"
 cat "$WORK/rt.ctl" "$WORK/lt.ctl" > "$WORK/all.ctl"
 chk "no @TOKEN@ in ANY control field (both packages)" "$(cnt '@[A-Za-z_]*@' "$WORK/all.ctl")" 0
-chk "no unexpanded \${binary:Version}" "$(cnt '\${binary:Version}' "$WORK/all.ctl")" 0
+# NIT-2 (removed): a `no unexpanded ${binary:Version}` row used to sit here. It was unfalsifiable
+# through every code path -- render.sh:231 refuses a leftover ${binary:Version}, build-deb.sh's
+# check_no_tokens re-checks the installed file, and dpkg-deb itself refuses to build a package whose
+# *relationship* field still carries it ("epoch in version is empty") -- so the review measured that
+# neutering all four upstream guards still could not make the row red. A row that cannot fail is
+# worse than no row, and leaving it in would let the brief's "leave ${binary:Version} unsubstituted"
+# mutation be *credited* to a row that never fires. The substitution is instead anchored where it is
+# genuinely falsifiable: `the launcher pins the runtime to THIS version` (the rendered pin, a
+# positive assertion on the substituted value) plus `the builder exits 0` (which the
+# `binary-version` BREAK label does redden, and whose log names ${binary:Version}).
 chk "Architecture: amd64 (the runtime is amd64-only)" "$(dpkg-deb -f "$RT" Architecture 2>/dev/null)" amd64
 chk "Architecture: all (the launcher is text)" "$(dpkg-deb -f "$LT" Architecture 2>/dev/null)" all
 
@@ -340,6 +402,24 @@ irc=0; iout=$(dpkg-deb -I "$RT" 2>&1) || irc=$?
 chk "dpkg-deb -I parses the control file" "$irc" 0
 printf '%s\n' "$iout" > "$WORK/rt.I"
 chk "dpkg-deb -I printed the fields (not an empty read)" "$(cnt '^ Package: darling-lol$' "$WORK/rt.I")" 1
+
+# --- the @MAINTAINER@ seam (C43-g, MENOR-1/MENOR-4) ---------------------------------------------
+sec "the @MAINTAINER@ seam (C43-g): the deb path always passes an address-bearing contact"
+note "render.sh:27's shared default is still 'darling-lol maintainers' (no address) -- the T1-owned"
+note "file the brief freezes for T3 (MENOR-4). The .deb path does not rely on it: build-deb.sh"
+note "always passes its own contact, and its default carries an address. The four rows below are the"
+note "guard that makes the reliance impossible, and both shipped Maintainer fields are checked too."
+# The default must be a full `Name <addr>` phrase, not a bare address: lintian rejects a bare
+# address with `E: no-phrase` (and the old wrapped form nests: that is MENOR-1). Sourced from
+# builder.code so the `maintainer-addressless` mutation can reach it.
+chk "build-deb.sh's OWN default carries an address (a bare address is E: no-phrase)" \
+  "$(grep -cE '^maintainer=\$\{MAINTAINER:-[^}]*<[^>]*@[^>]*>\}' "$WORK/builder.code")" 1
+chk "and it always hands that contact to render.sh (never render.sh's addressless default)" \
+  "$(grep -cF -- '--maintainer "$maintainer"' "$WORK/builder.code" || true)" 1
+chk "the runtime's SHIPPED Maintainer carries an address" \
+  "$(dpkg-deb -f "$RT" Maintainer 2>/dev/null | grep -cE '<[^>]*@[^>]*>' || true)" 1
+chk "the launcher's SHIPPED Maintainer carries an address too" \
+  "$(dpkg-deb -f "$LT" Maintainer 2>/dev/null | grep -cE '<[^>]*@[^>]*>' || true)" 1
 
 # --- G-DEB-3 ------------------------------------------------------------------------------------
 sec "G-DEB-3  no DEBIAN/conffiles (C5/C7: registering resolv.conf is a lintian error)"
@@ -490,8 +570,10 @@ chk "no override line uses a tag NAME lintian has renamed away (the old spelling
 sec "G-DEB-4  lintian --fail-on error (the row the copyright/override mutations turn red)"
 LINTIAN_IMAGE=${T3_LINTIAN_IMAGE:-ubuntu:24.04}
 if [ "${T3_GATES_DOCKER:-0}" != 1 ]; then
+  dockerskip=1
   skip "G-DEB-4 not run: lintian is not installed on this box (Debian 12 carries 2.116.3; the PLAN measured C4 with 2.122.0) and installing it is a host modification. Re-run with T3_GATES_DOCKER=1 to run the brief's container (image: $LINTIAN_IMAGE)"
 elif ! command -v docker >/dev/null 2>&1; then
+  dockerskip=1
   skip "G-DEB-4 not run: docker is not installed (T3_GATES_DOCKER=1 was set)"
 else
   lrc=0
@@ -580,6 +662,16 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
   ctl essential-depends  "the launcher does not depend on an Essential package unversioned (F11: bash and coreutils are Essential: yes)"
   ctl no-trailing-newline "every file in packaging/deb/ ends with a newline (T1 hygiene row globs common/ + testdata/ only, F6)"
   ctl binary-version     'the builder exits 0 (fixture mode)' '${binary:Version}'
+  # MENOR-2: the row that used to PASS while a zstd member was present. The mutation flips only the
+  # launcher's `-Zxz`, so the runtime row stays green and this one (plus the swept "either" row)
+  # must redden.
+  ctl launcher-zstd      "the launcher's data member is xz"
+  # MENOR-1: PLAN 9.1 rev 7's wrapped Maintainer:, put back -- with a real contact it nests, and the
+  # exact-value row is what sees it offline.
+  ctl maintainer-wrapped "Section/Priority/Homepage/Maintainer as the templates say (F10: otherosfs, not games)"
+  # MENOR-4: the builder's own default, made addressless (the state render.sh:27 still ships). The
+  # guard rows that assert the deb path never relies on render.sh's default are what redden.
+  ctl maintainer-addressless "build-deb.sh's OWN default carries an address (a bare address is E: no-phrase)"
 
   # G-DEB-4 is the row the container work exists for, so it must be able to go red too -- and only
   # the container can show that: the same no-copyright mutation makes lintian report
@@ -594,6 +686,32 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
     ck=$(printf '%s\n' "$cout" | grep -cF "E: darling-lol: no-copyright-file")
     if [ "$ck" -ge 1 ]; then ok "and the child's lintian output names E: no-copyright-file"
     else no "the child's lintian output does not name no-copyright-file"; fi
+
+    # MENOR-3: the plan's own override mutation, discharged IN-TREE. `override-tag` above deletes a
+    # *warning*-severity line, which proves the in-tree TEXT row but leaves `--fail-on error` at rc 0
+    # (F14). This deletes an *error*-severity line, so only the container can see it: the child's
+    # "0 E: lines over both packages" row must fail and lintian must print
+    # `E: darling-lol: binary-from-other-architecture` for both stand-ins. Without this control the
+    # override list's container load-bearing-ness would be asserted nowhere in the deliverable.
+    crc=0; cout=$(T3_GATES_BREAK=override-error-tag bash "$0" 2>&1) || crc=$?
+    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over both packages")
+    if [ "$crc" != 0 ] && [ "$cn" = 1 ]; then ok "T3_GATES_BREAK=override-error-tag -> G-DEB-4 goes red INSIDE the container (rc $crc)"
+    else no "T3_GATES_BREAK=override-error-tag: G-DEB-4 did not go red inside the container (rc $crc, $cn matching rows)"; fi
+    ck=$(printf '%s\n' "$cout" | grep -cF "E: darling-lol: binary-from-other-architecture")
+    if [ "$ck" -ge 1 ]; then ok "and the error-severity override's removal names E: binary-from-other-architecture"
+    else no "the child's lintian output does not name binary-from-other-architecture"; fi
+
+    # MENOR-1/C43-g: the plan's own Maintainer mutation, anchored where the plan says it is seen.
+    # Reverting control.in:6 to PLAN 9.1 rev 7's wrapped form makes the rendered contact nest
+    # (`darling-lol maintainers <darling-lol maintainers <addr>>`); dpkg-deb accepts it (rc 0), so
+    # only lintian sees it -- and it must print `E: malformed-contact`.
+    crc=0; cout=$(T3_GATES_BREAK=maintainer-wrapped bash "$0" 2>&1) || crc=$?
+    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over both packages")
+    if [ "$crc" != 0 ] && [ "$cn" = 1 ]; then ok "T3_GATES_BREAK=maintainer-wrapped -> G-DEB-4 goes red INSIDE the container (rc $crc)"
+    else no "T3_GATES_BREAK=maintainer-wrapped: G-DEB-4 did not go red inside the container (rc $crc, $cn matching rows)"; fi
+    ck=$(printf '%s\n' "$cout" | grep -cF "E: darling-lol: malformed-contact")
+    if [ "$ck" -ge 1 ]; then ok "and the nested Maintainer names E: malformed-contact (C43-g's measured class)"
+    else no "the child's lintian output does not name malformed-contact"; fi
 
     # The two rc rows are only as good as the container's exit status, and a trailing `echo` after
     # lintian would make them green no matter what lintian did (measured: it did, until the inner
@@ -620,6 +738,13 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
 fi
 
 sec "SUMMARY"
+# NIT-5: a battery that is green while G-DEB-4 never ran is exactly the CI wiring NIT-5 warns
+# about. Opt-in, because a bare offline run cannot run lintian: with T3_GATES_REQUIRE_DOCKER=1 a
+# skipped policy gate is a FAILURE, not a yellow line.
+if [ "$REQUIRE_DOCKER" = 1 ]; then
+  chk "G-DEB-4 ran (T3_GATES_REQUIRE_DOCKER=1 forbids a green battery with the policy gate skipped)" \
+    "$([ "$dockerskip" = 0 ] && echo ran || echo skipped)" ran
+fi
 printf '  %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
 [ "$skips" = 0 ] || printf '  \033[33m%d row(s) SKIPped: SKIP is not PASS\033[0m\n' "$skips"
 [ "$fail" = 0 ] || exit 1

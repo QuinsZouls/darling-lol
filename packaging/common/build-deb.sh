@@ -43,8 +43,13 @@
 #   TAG                  version tag (default: `git describe --tags --always`). Pass it explicitly
 #                        in CI and in harnesses: a value inherited from the checkout is state this
 #                        script does not own (TASKS rule 7/C35).
-#   MAINTAINER           the address in `Maintainer:`/the changelog trailer. Default:
-#                        darling-lol@users.noreply.github.com (PLAN 25 Q1).
+#   MAINTAINER           the FULL contact (a `Name <addr>` phrase) in `Maintainer:` and in the
+#                        changelog trailer. It cannot be a bare address: lintian rejects that with
+#                        `E: no-phrase`, and it cannot live wrapped in the template either, because
+#                        a real `--maintainer` would then nest (`C43-g`). Default:
+#                        `darling-lol maintainers <darling-lol@users.noreply.github.com>`
+#                        (PLAN 25 Q1). This is the one place the address lives: all four
+#                        `@MAINTAINER@` sites carry the bare token.
 #   FIXTURE_DIR          where `fixture` builds the staged tree (default: $DIST/fixture).
 #   UPSTREAM_COPYRIGHT   pinned upstream debian/copyright to inline (default:
 #                        <repo>/build/darling-src/debian/copyright).
@@ -70,7 +75,7 @@ mode=production
 case "${1:-}" in
   "") : ;;
   fixture) mode=fixture ;;
-  -h | --help) sed -n '2,46p' "$0"; exit 0 ;;
+  -h | --help) sed -n '2,59p' "$0"; exit 0 ;;
   *) fatal "unknown argument '$1' (usage: $prog [fixture])" ;;
 esac
 [ "$#" -le 1 ] || fatal "too many arguments (usage: $prog [fixture])"
@@ -90,7 +95,7 @@ case "$dist" in
   *) dist=$repo/$dist ;;
 esac
 fixture_dir=${FIXTURE_DIR:-$dist/fixture}
-maintainer=${MAINTAINER:-darling-lol@users.noreply.github.com}
+maintainer=${MAINTAINER:-darling-lol maintainers <darling-lol@users.noreply.github.com>}
 upstream_copyright=${UPSTREAM_COPYRIGHT:-$repo/build/darling-src/debian/copyright}
 # An explicit --tag is passed to render.sh in every mode: without it render.sh would fall back to
 # `git describe`, i.e. to state that belongs to whatever checkout happens to be current.

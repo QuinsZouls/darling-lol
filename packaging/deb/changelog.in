@@ -3,4 +3,4 @@ darling-lol (@VERSION@) unstable; urgency=low
   * Runtime built from darling @UPSTREAM_SHORT@ + darling-lol @COMMIT_SHORT@.
   * Packaged at prefix /usr (the release tarball uses /usr/local).
 
- -- darling-lol maintainers <@MAINTAINER@>  @DATE_RFC2822@
+ -- @MAINTAINER@  @DATE_RFC2822@

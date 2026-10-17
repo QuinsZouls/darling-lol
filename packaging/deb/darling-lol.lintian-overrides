@@ -8,9 +8,19 @@
 #     non-executable-script, example-interpreter-not-in-package. `grep -r <name> /usr/share/lintian`
 #     finds nothing at all for any of them -- they are absent from this lintian, not renamed -- so
 #     they are not listed here. See the T3 report, finding F9.
-#   * a line is either MEASURED on the fixture package of packaging/testdata/run-deb-gates.sh
-#     (delete it and the battery's G-DEB-4 row goes red: the tag is load-bearing), or it is one of
-#     the content classes PLAN 9.6 lists for the real payload and is marked "NOT MEASURED HERE".
+#   * a line is either MEASURED on the fixture package of packaging/testdata/run-deb-gates.sh, or it
+#     is one of the content classes PLAN 9.6 lists for the real payload and is marked "NOT MEASURED
+#     HERE". A MEASURED line says *how* it is load-bearing, and the two kinds are not
+#     interchangeable (T3 review MENOR-3):
+#       - **load-bearing for lintian**: delete the line and `lintian --fail-on error` over the
+#         fixture exits 2 with an `E:` -- the dedicated `override-error-tag` mutation proves it. Only
+#         an *error-severity* tag qualifies; a warning tag does not (report finding F14).
+#       - **load-bearing for the in-tree text row**: delete the line and the battery's override
+#         CONTENT row (`the runtime's override names ...`) goes red. That is a statement about this
+#         file's text, not about lintian: a warning-severity tag reddens the row and leaves
+#         `lintian` at rc 0.
+#     A line can also be MEASURED and deliberately weightless (nothing depends on it -- see
+#     symlink-is-self-recursive at the end): that is a third state, and it is labelled as such.
 #   * the error-severity tags below are content classes, not oversights: the remedy would be
 #     rewriting Apple's guest tree, and PLAN 9.6/§13.1/§13.4 accept shipping it byte-for-byte.
 #     The two error tags that are about OUR control file (Section: contrib/games and the launcher's
@@ -52,16 +62,20 @@ unstripped-binary-or-object *
 # MEASURED HERE.
 custom-library-search-path *
 
-# MEASURED on the fixture, both stand-ins (`usr/bin/write` and `libguest.bin`): the payload is
-# x86-64 by construction (C2) and the guest ships pre-built binaries, but the staged stand-ins are
-# 4-byte-magic fakes whose header can never match "amd64", so the tag fires. PLAN 9.6 lists it. It
-# is the one line here that suppresses an error tag on a condition a human might want to see, so
-# T11's payload re-measurement owns re-checking it against the real tree.
+# MEASURED (load-bearing for lintian -- `override-error-tag`). Deleting this line makes the
+# container's `lintian --fail-on error` exit 2 with
+# `E: darling-lol: binary-from-other-architecture` for both stand-ins (`usr/bin/write` and
+# `libguest.bin`): the payload is x86-64 by construction (C2) and the guest ships pre-built
+# binaries, but the staged stand-ins are 4-byte-magic fakes whose header can never match "amd64",
+# so the tag fires. PLAN 9.6 lists it. It is the one line here that suppresses an error tag on a
+# condition a human might want to see, so T11's payload re-measurement owns re-checking it against
+# the real tree.
 binary-from-other-architecture *
 
-# MEASURED. /usr/bin/darling is setuid root because the runtime starts a container as root and then
-# drops privileges (PLAN 13.1), and the guest's own usr/bin/write is 2755 in macOS -- content we
-# ship byte-for-byte.
+# MEASURED (load-bearing for the in-tree override TEXT row -- `override-tag`, NOT for lintian; a
+# WARNING tag does not move `--fail-on error`, so F14). /usr/bin/darling is setuid root because the
+# runtime starts a container as root and then drops privileges (PLAN 13.1), and the guest's own
+# usr/bin/write is 2755 in macOS -- content we ship byte-for-byte.
 #
 # ONE line has to cover both files, and it cannot name them. Lintian renamed this tag
 # (setuid-binary -> elevated-privileges) and turned the mode/owner into a NOTE, not a context: 2.117
@@ -74,7 +88,9 @@ binary-from-other-architecture *
 #   usr/libexec/darling/usr/bin/write    2755 root/root   (macOS guest content, shipped as-is)
 elevated-privileges *
 
-# MEASURED. /usr/libexec/darling/Volumes/DarlingEmulatedDrive -> / is intentional (C19: the guest
-# resolves its own boot volume that way, and files.all must not walk through it -- a gate exists for
-# that). Lintian's "you can infinitely chdir with this symlink" is the same fact as a warning.
+# MEASURED HERE, deliberately WEIGHTLESS (the fixture fires it). /usr/libexec/darling/Volumes/DarlingEmulatedDrive -> / is
+# intentional (C19: the guest resolves its own boot volume that way, and files.all must not walk
+# through it -- a gate exists for that). Lintian's "you can infinitely chdir with this symlink" is
+# the same fact as a warning. It is a WARNING, so it is load-bearing neither for `--fail-on error`
+# nor for any in-tree row: it documents a silenced hint, nothing depends on it.
 symlink-is-self-recursive *

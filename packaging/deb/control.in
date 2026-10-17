@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: contrib/otherosfs
 Priority: optional
 Architecture: amd64
-Maintainer: darling-lol maintainers <@MAINTAINER@>
+Maintainer: @MAINTAINER@
 Homepage: https://github.com/QuinsZouls/darling-lol
 Depends: @DEPS@
 Conflicts: @CONFLICTS@
