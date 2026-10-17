@@ -20,7 +20,7 @@
 #     tools/install-riot-darling-server.py:89
 #         parser.add_argument("--destination", type=Path, default=Path("/usr/local/bin/darlingserver"))
 #
-# and that path is not on check-prefix.sh's 4-file allowlist, so sweeping a tree that contains the
+# and that path is not on check-prefix.sh's allowlist (8 names, T8c), so sweeping a tree that contains the
 # real file with the literal FATALs (this is exactly mutation M7). Keeping the discrepancy hidden
 # behind the fixture would hide a live bug, so this guard runs the delivered gate over a tree in
 # which the ONLY difference from the desirable state is that the installer is the REAL tracked file,

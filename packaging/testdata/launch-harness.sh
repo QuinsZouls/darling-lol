@@ -505,6 +505,11 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
       "$(cmp -s "$P/usr/lib/darling-lol/scripts/configure.py" "$REPO/scripts/configure.py" && echo same || echo differs)" same
   chk "R3b the staged common.py is the repo's own file" \
       "$(cmp -s "$P/usr/lib/darling-lol/scripts/common.py" "$REPO/scripts/common.py" && echo same || echo differs)" same
+  # R4 and R8 keep EXACT counts on purpose (NIT-2 disposition, T8d): both pin facts of a file this
+  # repo OWNS and generates (the wrapper template packaging/install/darling-lol.in and the doc
+  # inventory build-launcher.sh stages), never a number an upstream merge can move -- unlike the
+  # old R9, which is why only R9 was re-cut. A deliberate template/doc edit is the same-commit
+  # reminder, not merge rot. R2/R2b already prove the staged wrapper IS this template's render.
   chk "R4 the staged wrapper still names @GUEST_HOME@ in a comment (comments untouched)" \
       "$(grep -c '@GUEST_HOME@' "$P/usr/bin/darling-lol")" 1
   chk "R5 the staged wrapper has no residual token on a code line" \
@@ -514,23 +519,32 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
   chk "R6 the staged tools are UNRENDERED (count-agnostic, never a file count)" "$([ "$ntok" -gt 0 ] && echo yes || echo no)" yes
   chk "R7 no staged file carries /home/runner (the D4 bug)" \
       "$(find "$P/usr/bin" "$P/usr/lib/darling-lol" -type f -exec grep -l '/home/runner' {} + 2>/dev/null | wc -l | tr -d ' ')" 0
+  # R8/R8b: the R-4 split invariant (the doc dir holds exactly the launcher's own README).
   chk "R8 exactly ONE staged file under usr/share/doc/darling-lol (R-4)" \
       "$(find "$P/usr/share/doc/darling-lol" -type f | wc -l | tr -d ' ')" 1
   chk "R8b and it is README-packaging.md" \
       "$(find "$P/usr/share/doc/darling-lol" -type f -name README-packaging.md | wc -l | tr -d ' ')" 1
-  # This is the SECOND copy of check-prefix.sh's allowlist: the R block recomputes the payload's
-  # facts with `find`/`grep` rather than shelling out to the gate. 🚨 The two must move together:
-  # T8c added the 8th entry below and this count went 7 -> 8 in the same commit. Measured with only
-  # check-prefix.sh fixed: R9 stayed green by accident (7 matching lines) and R9b went red,
-  # PASS=83 FAIL=1.
-  allowed='^(usr/bin/darling-lol|usr/lib/darling-lol/(scripts/common\.py|tools/((build-riot-power-(assertion|notify)-check|build-riot-(metal-presentation|x11-runtime))\.py|build-riot-urlsession-check\.py|riot_overlay_audit\.py)))$'
+  # The allowlist has exactly ONE home: check-prefix.sh (T8d/MINOR-2). The R block used to keep a
+  # SECOND, COUNT-PINNED copy of it here (`grep -cE "$allowed"` == 8), so every upstream merge that
+  # added a reader forced a same-commit edit -- the T8c event, where with only check-prefix.sh fixed
+  # R9 stayed green by accident (7 matching lines) and R9b went red, PASS=83 FAIL=1. The harness now
+  # ASKS the gate for its allowlist and compares the staged hits against it as a SET, in BOTH
+  # directions: no count is asserted, and a future merge needs no edit here. (If --print-allowlist
+  # fails or answers nothing, R9a and R9 go red -- fail closed -- while R9b's comparison is then
+  # trivially empty, which is why R9a exists as the non-empty assertion.)
   hits=$(find "$P/usr/bin" "$P/usr/lib/darling-lol" -type f -exec grep -Il 'usr/local' {} + 2>/dev/null \
-           | sed "s|^$P/||" | sort)
-  chk "R9 the staged /usr/local text hits are exactly the 8 allowlisted readers" \
-      "$(printf '%s\n' "$hits" | grep -cE "$allowed")" 8
-  chk "R9b no staged file outside the allowlist carries /usr/local" \
-      "$(printf '%s\n' "$hits" | grep -vcE "$allowed")" 0
-  printf '%s\n' "$hits" | sed 's/^/     allowlisted: /'
+           | sed "s|^$P/||" | LC_ALL=C sort)
+  wl=$(sh "$REPO/packaging/common/check-prefix.sh" --print-allowlist 2>/dev/null) || wl=""
+  chk "R9a check-prefix.sh --print-allowlist answers with its allowlist (count-free)" \
+      "$([ -n "$wl" ] && echo yes || echo no)" yes
+  printf '%s\n' "$hits" | grep -v '^$' | LC_ALL=C sort -u > "$W/r9.hits"
+  printf '%s\n' "$wl"   | grep -v '^$' | LC_ALL=C sort -u > "$W/r9.allow"
+  chk "R9 no staged /usr/local text hit is off check-prefix.sh's allowlist" \
+      "$(comm -23 "$W/r9.hits" "$W/r9.allow" | wc -l | tr -d ' ')" 0
+  chk "R9b every reader check-prefix.sh allowlists is present in the staged tree" \
+      "$(comm -13 "$W/r9.hits" "$W/r9.allow" | wc -l | tr -d ' ')" 0
+  # (the `|` delimiter, not `/`: the label itself contains slashes)
+  printf '%s\n' "$hits" | grep -v '^$' | sed 's|^|     staged /usr/local hit: |'
 fi
 
 echo; echo "=============================================="
