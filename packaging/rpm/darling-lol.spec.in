@@ -1,0 +1,167 @@
+# darling-lol -- pinned+patched Darling runtime for League of Legends, built at prefix /usr.
+#
+# Metadata mechanics follow the pinned upstream rpm/SPECS/darling.spec (darlinghq/darling @
+# 60ba801decee7a00782f74f6be4c8ffb013f79ff): __os_install_post/debug_package suppression and
+# the quoted "%files -f" generator. Attribution: GPL-3.0-or-later, see %%{_docdir}/copyright.
+# (The double-% spelling is deliberate: rpm expands macros inside *comments* too and warns about it
+# -- measured on rpm/rpmspec 4.20.1, one spec with two comment lines: "only a bare, undefined %a"
+# warns about NOTHING, while "the braced spelling of a defined macro: %%{_docdir}" warns "warning:
+# Macro expanded in comment on line 2". The warning is per MACRO, not per comment line, so this
+# escape is the one that matters here; G-RPM-1 measures the pair (C43-n) and asserts rpmspec's
+# stderr, not only its exit code. The %%a in %post below is a different trap again: rpm expands
+# macros inside *scriptlets* whether or not the macro is defined, and the assert that reads the
+# mode is what would silently stop firing (PLAN 10.1 note 2).)
+#
+# DEVIATION from upstream, deliberate: upstream keeps automatic dependency generation on and
+# filters it with __requires_exclude, because it also ships its own Mach-O dependency generator
+# (rpm/darling-macho-deps.spec -> /usr/lib/rpm/fileattrs/darling.attr + darling-deps.req).
+# We do not ship that generator, so the auto-scanner would walk 33 498 files -- including 142
+# Mach-O binaries named *.so -- and emit sonames that exist on no RPM distro (libavcodec.so.60
+# is Ubuntu 24.04's ffmpeg 6.x; Fedora 41 ships .so.61). Hence AutoReqProv: no plus an explicit,
+# reviewed Requires list. Side effect, accepted: no automatic Provides either, which is correct
+# because nothing on the host should link against Darling's guest libraries. (PLAN 10.1, C11.)
+%global __os_install_post %{nil}
+%define debug_package %{nil}
+# The payload compressor is pinned so the artifact cannot silently change when the build distro's
+# macros change (PLAN 10.1, EVIDENCE C12). PLAN 10.1 writes the value as w19T.zstd and rpmbuild
+# 4.20.1 REJECTS that spelling -- measured, `RPM build errors: Unknown payload compression:
+# w19T.zstd`, rc=1, exit after 0 packages -- while `rpmspec -P` on the same spec still returns
+# rc=0, so G-RPM-1 cannot see it and only G-RPM-2 dies. In rpm's _binary_payload syntax the
+# compressor names are rpmio's: zstdio (zstd), gzdio (gzip), xzdio (xz). w19T.zstdio is the
+# smallest faithful correction of the plan's value: same zstd, same level 19, same T flag.
+%global _binary_payload w19T.zstdio
+%global _buildshell /bin/bash
+AutoReqProv:    no
+
+Name:           darling-lol
+Version:        @RPM_VERSION@
+Release:        @RPM_RELEASE@
+Summary:        macOS translation layer patched for League of Legends
+License:        GPL-3.0-or-later AND APSL-2.0 AND LGPL-2.1-or-later AND BSD-3-Clause
+URL:            https://github.com/QuinsZouls/darling-lol
+Source0:        %{name}-%{version}-root.tar.zst
+Source1:        %{name}-filelist.txt
+Source2:        %{name}-copyright.txt
+Source3:        %{name}-BUILD-INFO.txt
+
+# The runtime owns /usr/bin/darling, /usr/bin/darlingserver and /usr/libexec/darling/**, which
+# is exactly what every upstream darling* subpackage owns. The conflict is path-level, not
+# stylistic: two Darling runtimes cannot coexist.
+Conflicts:      @RPM_CONFLICTS@
+Obsoletes:      darling < 999
+
+# render.sh expands the requires token -- the only occurrence of it in this file, on the line
+# below -- to ONE "Requires: <entry>" line per entry of packaging/common/deps.rpm.fc41 (PLAN 8.4),
+# so the token stands alone on its own line. When this template was written PLAN 10.1 wrote it as
+# "Requires: <token>"; that line renders to the double-prefixed "Requires:       Requires: glibc"
+# and rpm then carries a dependency on a package literally named "Requires:", unsatisfiable, while
+# `rpmspec -P` still returns rc=0 (see the T4 report and PLAN 10.1's C43-k note, which now rules the
+# same bare-token form). The bare token on its own line is the only shape render.sh's contract
+# supports; anything else is a silent metadata corruption, not a parse error.
+@RPM_REQUIRES@
+# ffmpeg is a Recommends, not a Requires: Fedora 41 ships libavcodec.so.61 while the guest
+# wrappers dlopen libavcodec.so.60. A hard Requires would be *satisfied* while the runtime
+# still fails, which is worse than an honest weak dependency (PLAN 8.2, risk R4).
+Recommends:     ffmpeg-libs
+Requires(post): systemd-filesystems
+Requires(postun): coreutils
+
+# No BuildRequires: this spec packages an already-installed tree. The build happens in
+# scripts/build-packaging.sh, outside rpmbuild, so that one cmake invocation feeds the deb,
+# the rpm, the Arch package and the tarball (PLAN 2, alternative A11 rejected).
+# ExclusiveArch, NOT BuildArch (PLAN 10.1, C43-l): `BuildArch:` accepts only `noarch`; a specific
+# architecture is `ExclusiveArch:`. Measured on rpm/rpmspec 4.20.1 (aarch64 host), minimal spec:
+# BuildArch: x86_64 => `rpmspec -P` rc=1, `error: No compatible architectures found for build`,
+# 0 bytes of stdout -- i.e. G-RPM-1 fails on the first run -- while ExclusiveArch: x86_64 =>
+# rc=0 with the full spec on stdout. The runtime payload is x86-64-only (PLAN 2), so the pin is
+# real: an arm64 build host must not produce an installable-but-unusable package.
+ExclusiveArch:  x86_64
+
+%description
+Pinned and patched Darling runtime, built at prefix /usr.
+
+Contains the translation layer itself: the darling(1) CLI (set-user-ID root,
+required by the runtime), darlingserver, darling-coredump, and the macOS
+guest tree under /usr/libexec/darling. It does not contain the League of
+Legends launcher glue (see darling-lol-launcher) and it does not create or
+own ~/.darling -- the darling CLI builds that per-user prefix on first run.
+
+Upstream Darling: https://www.darlinghq.org/
+
+%prep
+# nothing to unpack: Source0 is the staged tree, handled in %%install
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+# C50: `-I zstd -f`, NOT `-Jf`. Source0 is a .tar.zst and `-J` is xz; measured (GNU tar 1.35, zstd
+# 1.5.7): `-Jtf` on a real zstd tar => rc=2 `xz: (stdin): File format not recognized`, while
+# `-t -I zstd -f` reads BOTH flavours (zstd's CLI auto-detects xz here). This spelling is
+# therefore the robust side: it keeps working even against a stale xz Source0, and the builder
+# now writes real zstd under the name (build-rpm.sh, `zstd -19 -T0`).
+tar -xp --numeric-owner -I zstd -f %{SOURCE0} -C %{buildroot}
+install -D -m 0644 %{SOURCE2} %{buildroot}%{_docdir}/%{name}/copyright
+install -D -m 0644 %{SOURCE3} %{buildroot}%{_docdir}/%{name}/BUILD-INFO.txt
+
+%post
+# Assert the two things a broken install would otherwise hide until launch time.
+# NOTE the %%a: rpm expands macros inside scriptlets, so a literal `stat -c '%a'` must be
+# written %%a. Getting it wrong leaves a scriptlet that never reports a mode and an assert that
+# never fires (PLAN 10.1 note 2; mutation row "write %a instead of %%a").
+mode=$(stat -c '%%a' %{_bindir}/darling 2>/dev/null || echo missing)
+if [ "$mode" != 4755 ]; then
+    echo "darling-lol: FATAL %{_bindir}/darling is mode $mode, expected 4755 (setuid root)." >&2
+    exit 1
+fi
+if [ ! -x %{_libexecdir}/darling/usr/libexec/darling/mldr ]; then
+    echo "darling-lol: FATAL %{_libexecdir}/darling/usr/libexec/darling/mldr missing." >&2
+    exit 1
+fi
+# Reload binfmt handlers; never fatal (binfmt_misc may be unavailable, and the CLI does not
+# need it -- it execs mldr directly).
+if [ -d /run/systemd/system ]; then
+    systemctl restart systemd-binfmt.service >/dev/null 2>&1 || \
+        echo "darling-lol: note: could not restart systemd-binfmt; handlers register at next boot."
+fi
+cat <<'EOF'
+darling-lol: installed. Next: install darling-lol-launcher, then run 'darling-lol'.
+EOF
+
+%postun
+if [ -d /run/systemd/system ]; then
+    systemctl restart systemd-binfmt.service >/dev/null 2>&1 || true
+fi
+
+# %files -f %%{SOURCE1} is the QUOTED runtime list produced by packaging/common/stage.sh step 3 --
+# the only quoting that survives the payload's 53 space-paths and 2189 '%'-paths. Do NOT add a
+# second layer of quoting or a perl escape on top: measured, it silently corrupts the list
+# (EVIDENCE 7.2). build-rpm.sh copies it byte-for-byte, minus the launcher's paths (the two
+# packages must not claim the same files -- PLAN 5 / G-STATIC-6 / C18), and that subtraction adds
+# no quoting of its own: every line emitted is a byte-identical copy of a stage.sh line.
+%files -f %{SOURCE1}
+%defattr(-,root,root,-)
+# The hardened paths' %%attr lines are IN the generated list %%{SOURCE1} (build-rpm.sh replaces
+# each hardened path's plain entry with its %%attr form), not repeated here: one path, one entry.
+# A path owned both through the list AND explicitly is `warning: File listed twice` (measured on
+# rpm 4.20.1 -- the plan's C52 says rc=1, which does not reproduce in isolation: warning, rc=0),
+# and appending instead of replacing reproduces it inside the list too. Re-adding a block here
+# would therefore be a silent duplicate: G-RPM-2 asserts `0 File listed twice` over the build log,
+# so this cannot rot back in unnoticed.
+# The %%attr in the list is what makes the setuid bit the PACKAGE's rather than Source0's: rpm
+# applies it over whatever the payload carried, so a lost bit cannot survive into the package
+# (G-RPM-2 measures 0104755 over a sibling staged 0644).
+# Empty directories: one %%dir line per entry of dist/pkg/files.emptydirs. A directory that is not
+# owned with %%dir is never removed on uninstall. The block is generated by build-rpm.sh and spliced
+# in at this marker line, which is written in the same at-sign token shape as render.sh's own
+# placeholders -- so a lost splice fails the build instead of shipping a literal marker (G-STATIC-4).
+@RPM_EMPTYDIRS@
+%doc %{_docdir}/%{name}/copyright
+%doc %{_docdir}/%{name}/BUILD-INFO.txt
+
+# C54: the %%changelog is not decoration. rpm's %%_source_date_epoch_from_changelog (on in Fedora)
+# takes the package's source date from its newest entry; without the section rpmbuild says
+# "warning: ...is set, but %%changelog has no entries to take a date from" and the rpm has NO
+# pinned source date (measured). The date below is pinned from the SOURCE by build-rpm.sh
+# ($SOURCE_DATE_EPOCH when set, else HEAD's commit date), never from the clock; the block is
+# spliced here because render.sh's token table is T1's (T4 -> T1 edge, PLAN C44/C54).
+@RPM_CHANGELOG@

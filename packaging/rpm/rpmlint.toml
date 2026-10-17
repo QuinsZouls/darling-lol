@@ -1,0 +1,64 @@
+# packaging/rpm/rpmlint.toml -- the rpmlint configuration for the darling-lol rpms (PLAN 10, 10.3).
+#
+# POLICY, the same as the deb overrides of PLAN 9.6: `errors` fail the gate (G-RPM-4), `warnings`
+# do not. A filter is therefore only ever written for an *error* this package can justify, and
+# every one of them is scoped: rpmlint 2.x applies these regexes to the whole message line
+# ("<pkg>.<arch>: E: <tag> <detail>"), so a filter that names the path or the value it exempts
+# leaves everything else reported. A blanket rule would be a lie -- which is exactly the reason
+# 9.6 gives for not writing `*` into the lintian overrides.
+#
+# Load it with `-c` (`--config`): see the FINDING in the T4 report -- rpmlint 2.x's `--file` is an
+# alias of `-r/--rpmlintrc` (a Python-ish `addFilter("…")` file), NOT a TOML config, so PLAN 10.3's
+# literal `rpmlint --file rpmlint.toml` cannot work on rpmlint 2.6.1; `-c` is the option that takes
+# this file. `Filters` is a list of regexes, merged (appended) onto the Fedora defaults.
+#
+# Every entry below is load-bearing: `rpmlint` reports "N filtered, M unused" and the G-RPM-4 gate
+# asserts the unused count is 0 AND that together the filters explain every error of the no-config
+# run -- so a filter that stops applying, or an error no filter covers, turns the gate red instead
+# of rotting here silently.
+#
+# This list has already collected on that rule once: `no-changelogname-tag` was here while the specs
+# deliberately had no %changelog, and adding the %changelog (PLAN C54, which also gives the rpm a
+# pinned source date) made it a DEAD filter -- so it is deleted, exactly as the gate's `dead = 0`
+# row demands. A config is a list of accepted truths, not a list of red things.
+#
+# Plan feedback, deliberately not "fixed" here: PLAN Q13 recommends four filters, measured against a
+# fixture whose error set differs from this one's. These seven are the of-record list -- the entries
+# the gate actually forces against the T1 fixture (measured: 0 dead, 0 unexplained, and `no-binary`
+# is NOT filtered, per Q13's warning, because it fires only for the fixture's stub payload while on
+# a real build it would name a genuine catastrophe).
+Filters = [
+    # rpmlint presumes automatic dependency generation and treats an explicit "Requires: <lib>"
+    # as a mistake. AutoReqProv is deliberately OFF here (PLAN 10.1, C11): the auto-scanner would
+    # walk the guest tree and emit sonames that exist on no RPM distro. The explicit, reviewed list
+    # in packaging/common/deps.rpm.fc41 is its replacement, so the check's premise does not hold
+    # for any requirement of this package -- hence a tag-level filter rather than a path-scoped one.
+    'explicit-lib-dependency',
+    # The guest tree is macOS content: 142 of its *.so files are Mach-O, and the fixture stages
+    # guest stubs that carry the ELF magic without being readable as ELF (usr/bin/write,
+    # usr/lib/libguest.bin -- measured; the *host* stand-ins have no ELF magic at all, they are NUL
+    # bytes plus strings). readelf cannot read either shape, exactly as it cannot read the same
+    # files on the real payload. Scoped to the guest subtree on purpose: the filter names the tree it
+    # exempts instead of the tag, so a host binary readelf cannot parse is still reported, and the
+    # G-RPM-4 gate asserts this filter matches >=1 message (unused filters fail the gate).
+    'readelf-failed /usr/libexec/darling/',
+    # /usr/bin/darling is set-user-ID root on purpose: the CLI starts the container as root and drops
+    # privileges. Upstream overrides the same lintian tag (PLAN 9.6); rpm needs the bit in metadata
+    # (%attr(4755,root,root) in the generated file list, Source1) and this is the check that
+    # notices it exists. The description spells it set-user-ID, so the word alone is no longer an
+    # error -- only the mode is, and it is the deliberate one.
+    'setuid-binary /usr/bin/darling',
+    # The guest's usr/bin/write is 2755 setgid in the payload and must stay that way (PLAN 13.1:
+    # nothing in the chain normalises modes inside libexec/darling).
+    'setgid-binary /usr/libexec/darling/usr/bin/write',
+    # The two modes above are "non-standard" only against rpmlint's default of 0755/0644; both are
+    # the deliberate values, named here per path so any *other* odd mode is still an error.
+    'non-standard-executable-perm /usr/bin/darling 4755',
+    'non-standard-executable-perm /usr/libexec/darling/usr/bin/write 2755',
+    # Technical terms the Fedora dictionary lacks. Only ONE is left and it is unavoidable:
+    # "coredump" is the shipped binary's own name (darling-coredump). "setuid" used to be here too;
+    # it is gone because the %description now spells it "set-user-ID" (PLAN C54), so a filter for it
+    # would be dead -- this is the same narrowing Q13 asks for, arrived at by removing the error
+    # instead of hiding it. Same technique as /etc/xdg/rpmlint/fedora.toml:302, additive here.
+    'spelling-error.* coredump',
+]

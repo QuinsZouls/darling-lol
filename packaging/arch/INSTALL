@@ -1,0 +1,29 @@
+#!/bin/sh
+# packaging/arch/INSTALL -- the Arch package's pacman hook file (PLAN §11.3, TASKS.md T6).
+#
+# pacman sources this inside its own transaction with cwd = /, so the paths below resolve against
+# the filesystem root (`usr/bin/darling` IS `/usr/bin/darling`) -- and every check is a *report*,
+# never a failure: a pacman hook cannot fail the transaction the way a dpkg postinst can
+# (PLAN §11.3, risk R11). That asymmetry is why install.sh re-asserts the setuid bit after the
+# package manager returns, for every family (PLAN §16.5), instead of trusting
+# this file. Hence `echo ... >&2` and never `exit 1`.
+#
+# makepkg does not add a shebang to .INSTALL; pacman does not need one (it sources the file with
+# its own shell). It is written anyway because the file is also a script a human may run, and
+# because a file that starts with `#!` is unambiguous to every linter in the tree (shellcheck).
+
+post_install() {
+    mode=$(stat -c '%a' usr/bin/darling 2>/dev/null || echo missing)
+    if [ "$mode" != 4755 ]; then
+        echo "darling-lol: FATAL /usr/bin/darling is mode $mode, expected 4755 (setuid root)." >&2
+    fi
+    if [ ! -x /usr/libexec/darling/usr/libexec/darling/mldr ]; then
+        echo "darling-lol: FATAL the real mldr is missing." >&2
+    fi
+    systemctl restart systemd-binfmt.service >/dev/null 2>&1 || true
+    echo "darling-lol: installed. Next: pacman -U darling-lol-launcher-*.pkg.tar.zst, then run 'darling-lol'."
+}
+
+post_upgrade() { post_install; }
+
+post_remove()  { systemctl restart systemd-binfmt.service >/dev/null 2>&1 || true; }

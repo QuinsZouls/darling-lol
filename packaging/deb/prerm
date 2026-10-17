@@ -1,0 +1,20 @@
+#!/bin/sh
+# prerm for darling-lol: no state to clean, so this is deliberately a no-op -- the runtime has no
+# daemon (darling starts and stops its own container per invocation) and ~/.darling belongs to the
+# user (N5, never touched by a maintainer script).
+#
+# It ships anyway, because dpkg calls it at every relevant transition and the `failed-upgrade` arm
+# is the one that is not optional: when the prerm of the *new* version fails, dpkg re-invokes the
+# prerm with `failed-upgrade` and asks it whether the upgrade can still be considered successful.
+# Exiting 0 there is the documented answer for a package with nothing to undo; without the arm the
+# call falls through to dpkg's default refusal and a recoverable upgrade turns into a broken dpkg
+# state (deb maintainer-script docs: prerm failed-upgrade <old-version>).
+set -e
+
+case "$1" in
+    remove | upgrade | deconfigure) : ;;
+    # the guard: nothing was stopped, so nothing has to be un-stopped to let the upgrade proceed.
+    failed-upgrade) : ;;
+esac
+
+exit 0

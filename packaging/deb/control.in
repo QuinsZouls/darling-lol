@@ -1,0 +1,25 @@
+Package: darling-lol
+Version: @VERSION@
+Section: contrib/otherosfs
+Priority: optional
+Architecture: amd64
+Maintainer: @MAINTAINER@
+Homepage: https://github.com/QuinsZouls/darling-lol
+Depends: @DEPS@
+Conflicts: @CONFLICTS@
+Breaks: darling (<< 999), darling-core (<< 999)
+Replaces: darling, darling-core
+Installed-Size: @INSTALLED_SIZE@
+Description: macOS translation layer patched for League of Legends
+ Pinned and patched Darling runtime, built at prefix /usr.
+ .
+ This package contains the translation layer itself: the darling(1) CLI
+ (setuid root, required by the runtime), darlingserver, and the 587 MB
+ macOS guest tree under /usr/libexec/darling.
+ .
+ It does NOT contain the League of Legends launcher glue; install
+ darling-lol-launcher for that. It also does not create or own
+ ~/.darling -- the darling CLI builds that per-user prefix on first run.
+ .
+ Upstream Darling: https://www.darlinghq.org/ (GPL-3.0-or-later,
+ Apple Public Source License 2.0 for the macOS-derived parts).
