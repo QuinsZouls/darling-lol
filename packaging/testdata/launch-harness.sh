@@ -22,6 +22,9 @@
 #   L4_PKG_ROOT         optional: a REAL staged tree (dist/pkg/root after packaging/common/
 #                       build-launcher.sh). Then the whole case machinery renders with the STAGED
 #                       scripts/ and the R block asserts the staged payload's own facts.
+#                       ABSENT: the R block does not run, the run says so on its own line and
+#                       reports its row count in the summary's SKIP= field (rc stays 0 -- tarball
+#                       mode is legal, it is just 14 rows smaller: PASS=71 FAIL=0 SKIP=14).
 #   GH_TOKEN            optional: read-only `gh release download` if no tarball was given.
 #                       Never printed and never passed on a command line.
 #   L4_REPO             optional: repo root override (default: the harness's own ../../).
@@ -29,6 +32,12 @@
 # Contract:
 #   * COUNT the PASS=/FAIL= line it prints at the end: that is the total that goes in the PR.
 #     (The rev-4 shape's 57/57 is historical; do not quote it for the shipped wrapper.)
+#   * The R block (the staged-tree rows) needs L4_PKG_ROOT. When that input is ABSENT the run says
+#     so on its own line, names how many counted rows that is, and repeats it in the summary's
+#     SKIP= field -- a bare PASS= over a block that silently did not run is exactly the defect
+#     this field exists to prevent (review C1). Tarball mode stays a LEGAL, GREEN mode (rc 0):
+#     SKIP= is a report of what was NOT run, never a claim that it passed, and it is never added
+#     into PASS=. Staged mode reports SKIP=0 and no such line.
 #   * A SKIP exits 77, never 0: a skipped gate must not be a green row.
 #   * Hermetic (TASKS preamble rule 7): every fixture is built by this run inside one private
 #     mktemp -d, inputs are repo-relative, and nothing is read from a shared path. The negative
@@ -44,7 +53,9 @@
 #   * launch-mkusr.py takes its source and output directories as arguments, so the sha256 pins in
 #     PLAN appendix A10f identify the EXECUTED artifacts but no longer match these shipped copies
 #     byte for byte (the patch rules are unchanged and both n==0 rules now fail loudly).
-#   * the R block is new: the rev-5 artifact had no way to look at the staged tree.
+#   * the R block is new: the rev-5 artifact had no way to look at the staged tree. Its /usr/local
+#     sweep is scoped to the whole staged HOST tree (the same scope check-prefix.sh (a) sweeps),
+#     not to usr/bin + usr/lib/darling-lol as it first shipped (review C2).
 set -u
 
 REPO=${L4_REPO:-}
@@ -490,9 +501,33 @@ has  "M first run renders" "$m1o" "rendering the launcher"
 lacks "M second run does NOT re-render (stamp is 'unknown' both times)" "$m2o" "rendering the launcher"
 
 # ------------------------------------------------------------------ R. the real staged tree
+#
+# C1: this block is gated on L4_PKG_ROOT, and it used to have no `else`. Without a staged tree the
+# whole block -- R1..R9b, R_ROWS counted rows -- simply vanished from the output and the run still
+# ended `G-LAUNCH-1: PASS=71 FAIL=0`, rc 0, with nothing saying 14 rows went unmeasured. The block
+# keeps its gate (a staged tree is its input; tarball mode is legal and must stay rc 0), but the
+# absence is now STATED and COUNTED in the summary's SKIP= field. R_ROWS is the block's own row
+# count; because a number that rots is the same lie in a new place, staged mode (the only mode that
+# can see the truth) asserts it against the row delta it actually measured just below, and goes RED
+# if a row is added or removed without bumping it.
+R_ROWS=14
+r_rows0=$((PASS + FAIL))
+r_ran=no
 if [ -n "${L4_PKG_ROOT:-}" ]; then
+  r_ran=yes
   echo; echo "=== R. the REAL staged tree (L4_PKG_ROOT=$L4_PKG_ROOT) ==="
   P=$L4_PKG_ROOT
+  # C2: the sweep SCOPE. R7 and R9 used to walk `$P/usr/bin $P/usr/lib/darling-lol` -- blind to
+  # usr/share/doc/** and to any future payload directory -- while the authoritative gate
+  # (check-prefix.sh part (a)) sweeps the whole host-side files.all list. So this "second opinion"
+  # was narrower than it read: a /usr/local literal planted in
+  # usr/share/doc/darling-lol/README-packaging.md left the old sweep green (R9=0). One scope
+  # variable, used by both rows, covers the whole staged `usr/` tree MINUS the guest SDK
+  # (usr/libexec/darling/**, whose ~362 /usr/local hits are Apple's and are a report in
+  # check-prefix.sh (b)/(e), never a failure) -- exactly the host-side scope that gate sweeps, so
+  # the two cannot disagree about which tree they are talking about.
+  sweep=$P/usr
+  sweep_skip=$sweep/libexec/darling
   printf '  \033[33mnote\033[0m cases A-M above rendered with %s (the STAGED scripts, not the checkout'"'"'s)\n' "$scripts_dir"
   chk "R1 the staged wrapper exists and is executable" "$([ -x "$P/usr/bin/darling-lol" ] && echo yes || echo no)" yes
   chk "R2 the staged wrapper is a 2-token render of packaging/install/darling-lol.in" \
@@ -518,7 +553,7 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
   printf '  \033[33mnote\033[0m %s staged template file(s) under tools/ still carry @GUEST_HOME@ (must be > 0)\n' "$ntok"
   chk "R6 the staged tools are UNRENDERED (count-agnostic, never a file count)" "$([ "$ntok" -gt 0 ] && echo yes || echo no)" yes
   chk "R7 no staged file carries /home/runner (the D4 bug)" \
-      "$(find "$P/usr/bin" "$P/usr/lib/darling-lol" -type f -exec grep -l '/home/runner' {} + 2>/dev/null | wc -l | tr -d ' ')" 0
+      "$(find "$sweep" -type f ! -path "$sweep_skip/*" -exec grep -l '/home/runner' {} + 2>/dev/null | wc -l | tr -d ' ')" 0
   # R8/R8b: the R-4 split invariant (the doc dir holds exactly the launcher's own README).
   chk "R8 exactly ONE staged file under usr/share/doc/darling-lol (R-4)" \
       "$(find "$P/usr/share/doc/darling-lol" -type f | wc -l | tr -d ' ')" 1
@@ -532,7 +567,10 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
   # directions: no count is asserted, and a future merge needs no edit here. (If --print-allowlist
   # fails or answers nothing, R9a and R9 go red -- fail closed -- while R9b's comparison is then
   # trivially empty, which is why R9a exists as the non-empty assertion.)
-  hits=$(find "$P/usr/bin" "$P/usr/lib/darling-lol" -type f -exec grep -Il 'usr/local' {} + 2>/dev/null \
+  # C2: the sweep is over the WHOLE staged host tree (`$sweep`, one variable, the same one R7 uses),
+  # not over two hand-picked subdirectories -- a subset scope is how the usr/share/doc gap lived.
+  printf '  \033[33mnote\033[0m R7/R9 sweep scope: %s (the whole staged host tree; guest SDK %s excluded)\n' "$sweep" "$sweep_skip"
+  hits=$(find "$sweep" -type f ! -path "$sweep_skip/*" -exec grep -Il 'usr/local' {} + 2>/dev/null \
            | sed "s|^$P/||" | LC_ALL=C sort)
   wl=$(sh "$REPO/packaging/common/check-prefix.sh" --print-allowlist 2>/dev/null) || wl=""
   chk "R9a check-prefix.sh --print-allowlist answers with its allowlist (count-free)" \
@@ -545,8 +583,33 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
       "$(comm -13 "$W/r9.hits" "$W/r9.allow" | wc -l | tr -d ' ')" 0
   # (the `|` delimiter, not `/`: the label itself contains slashes)
   printf '%s\n' "$hits" | grep -v '^$' | sed 's|^|     staged /usr/local hit: |'
+else
+  # C1: the block's input is absent, so the block did not run -- SAY it, and count it. Not a `no`
+  # (tarball mode is legal and stays rc 0) and never folded into PASS=: SKIP= is the report of what
+  # was NOT run. Greppable prefix so a runner (or a CI log search) can see at a glance that a
+  # G-LAUNCH-1 PASS= line in this mode is 14 rows short of the staged total.
+  echo
+  printf '  \033[33mskip\033[0m R block NOT RUN: L4_PKG_ROOT is unset (no staged tree) -> R1..R9b did NOT run, %s counted row(s) unmeasured (excluded from PASS=, reported as SKIP= below)\n' "$R_ROWS"
 fi
 
+# The R_ROWS self-check. Fail-only on purpose (a counted `ok` here would move the staged total, and
+# the number the tarball-mode note quotes must be the SAME number): staged mode is the only mode
+# that can measure the block's real row count, so it asserts the constant against it. A row added
+# or removed without bumping R_ROWS turns THIS red -- otherwise the constant would quietly
+# under-report what tarball mode did not run, which is the C1 defect again in a new place.
+# The delta is PASS+FAIL -- rows EXECUTED, whatever colour -- not PASS alone: a red row inside the
+# block must not look like a row that never ran (measured: with PASS only, the planted-doc run
+# reported "ran 13" and turned this row red on top of the real R9 failure).
+if [ "$r_ran" = yes ]; then
+  [ "$(( (PASS + FAIL) - r_rows0 ))" = "$R_ROWS" ] \
+    || no "RBLOCK: R_ROWS=$R_ROWS but the R block ran $(( (PASS + FAIL) - r_rows0 )) counted row(s) (bump R_ROWS in the same commit)"
+fi
+SKIP=$R_ROWS
+[ "$r_ran" = yes ] && SKIP=0
+
 echo; echo "=============================================="
-echo "G-LAUNCH-1: PASS=$PASS FAIL=$FAIL"
+echo "G-LAUNCH-1: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
+# Yellow, and only when there is something to say: SKIP is a report, never a failure -- but it must
+# not be silent either, and it must never be read as a pass (mirrors run-deb-gates.sh's note).
+[ "$SKIP" = 0 ] || printf '  \033[33m%s counted row(s) were NOT run in this mode: SKIP is not PASS\033[0m\n' "$SKIP"
 [ "$FAIL" = 0 ] || exit 1

@@ -18,6 +18,19 @@
 #
 #     T1_PLAN_FILE=/path/to/PLAN.md bash packaging/testdata/run-gates.sh
 #
+# SKIP accounting (review C4): `skip()` paints a row and now COUNTS it, and the summary prints it
+# (`N passed, M failed, K skipped`). A skipped row used to be visible in the body but invisible in
+# the total, so `72 passed, 0 failed` read as "the whole battery ran" while one row had not been
+# measured at all. What "expected to run" means here, decided and documented rather than implied:
+# all three skip sites are genuinely OPTIONAL inputs/tooling -- shellcheck and dpkg-deb are
+# convenience row-holders, and the PLAN (the T1_PLAN_FILE row) is not in this repo by design, so
+# its absence is the documented NORMAL state of a checkout and NOT a degraded environment. There is
+# therefore no expectation to violate: a skip is REPORTED, never turned into a failure, and rc stays
+# 0. (Contrast run-deb-gates.sh, where the docker row's input IS expected in CI and T3_GATES_REQUIRE_
+# DOCKER exists to force it; nothing here has a comparable expectation.) The counter is a real
+# counter, not a constant: with T1_PLAN_FILE set the same battery prints `73 passed, 0 failed, 0
+# skipped`, with it unset `72 passed, 0 failed, 1 skipped`.
+#
 # Companions: packaging/testdata/run-mutations.sh (the two mutation tables, self-asserting, with a
 # negative control), packaging/testdata/run-build-log-gates.sh (the install-log invariants of
 # scripts/build-packaging.sh, solved as 9 asserted cases) and packaging/testdata/state-probe.sh
@@ -58,11 +71,11 @@ done
 # must never run inside one. To reproduce a tagless box (the F4/F11 case) clone WITHOUT tags:
 #     git clone --no-tags <repo> /tmp/tagless && (cd /tmp/tagless && bash packaging/testdata/run-gates.sh)
 
-pass=0; fail=0
+pass=0; fail=0; skips=0
 ok()   { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 no()   { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 chk()  { if [ -z "$2" ]; then no "$1: EMPTY result (command failed)"; elif [ "$2" = "$3" ]; then ok "$1 ($2)"; else no "$1: got '$2', want '$3'"; fi; }
-skip() { printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
+skip() { skips=$((skips+1)); printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
 sec()  { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # the pattern this file searches for, built so that the file does not itself contain it
@@ -363,5 +376,6 @@ if [ -z "$BREAK" ]; then
 fi
 
 sec "SUMMARY"
-printf '  %d passed, %d failed\n' "$pass" "$fail"
+printf '  %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
+[ "$skips" = 0 ] || printf '  \033[33m%d row(s) SKIPped: SKIP is not PASS\033[0m\n' "$skips"
 [ "$fail" = 0 ] || exit 1
