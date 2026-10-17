@@ -15,9 +15,11 @@
 # one container run that MEASURES (build, query, collect) while every assertion is made here, on
 # the artifacts it collected.
 #
-#   T4_RPM_IMAGE=<image>      default `fedora:41`. A bare image pays `dnf -y install rpm-build
-#                             rpmlint` on every one of the (1 + N controls) container runs; to pay
-#                             it once, build the gate image the T4 report used:
+#   T4_RPM_IMAGE=<image>      default `fedora:41`, which is BARE (no rpm, no rpmspec, no rpmlint --
+#                             measured). The battery therefore provisions the gate image ONCE and
+#                             reuses the tag for the (1 + N controls) container runs; an explicit
+#                             T4_RPM_IMAGE is used as it is and refused if it has no toolchain. The
+#                             recipe it builds (the T4 report used this image):
 #
 #       docker build -t darling-rpm-gates:fc41 - <<'EOF'
 #       FROM fedora:41
@@ -106,6 +108,10 @@ esac
 
 BREAK=${T4_GATES_BREAK:-}
 IMAGE=${T4_RPM_IMAGE:-fedora:41}
+# One value, defined once, used by the host render, the container and every row that names a
+# version (see the two sites that read it). It is the tag PLAN's fixture convention carried as a
+# literal in build-rpm.sh until T6 moved the literal here -- packaging/common/ holds no version.
+FIXTURE_TAG=${T4_FIXTURE_TAG:-v0.1.0}
 CONTROLS=${T4_GATES_NO_CONTROLS:-}
 if [ -n "$BREAK" ]; then
   case " $CONTROL_NAMES " in
@@ -172,6 +178,13 @@ end_row() { # end_row LABEL
 }
 val()  { [ -f "$O/$1" ] && cat "$O/$1"; }                 # an artifact, or empty
 cnt()  { if [ -f "$O/$1" ]; then wc -l < "$O/$1" | tr -d ' '; else echo missing; fi; }
+cntn() { # cntn FILE -- cnt() as a NUMBER: 0 when the file is absent, so arithmetic cannot abort.
+  # Measured: with an artifact missing, the `missing` WORD reached `$(( ))`, the unset variable made
+  # `set -u` kill the whole table (line 869, the bare-image run) and the remaining rows were never
+  # reported -- a harness that cannot print the row that says "artifact missing" hides the diagnosis.
+  _c=$(cnt "$1")
+  case $_c in ''|*[!0-9]*) echo 0 ;; *) echo "$_c" ;; esac
+}
 num()  { # num FILE ERE -- how many lines of the artifact match the extended regex
   if [ -f "$O/$1" ]; then c=$(grep -c -E -- "$2" "$O/$1"); printf '%s' "${c:-0}"; else echo missing; fi
 }
@@ -226,14 +239,58 @@ if ! "$DOCKER" info >/dev/null 2>&1; then
 fi
 chk "container runtime" "$DOCKER" "$DOCKER"
 
+# The image must carry the rpm toolchain: a bare `fedora:41` has neither rpmbuild, rpmspec nor
+# rpmlint (measured), and the measurement run would then collect nothing while 19+ rows went red for
+# a missing PACKAGE rather than for the object under test. So the battery provisions its gate image
+# ONCE, from the recipe in this file's header, and every later run reuses the tag.
+image_ready() { # image_ready IMAGE -- the tools the container half reads
+  "$DOCKER" run --rm --entrypoint sh "$1" -c \
+    'command -v rpmbuild >/dev/null 2>&1 && command -v rpmspec >/dev/null 2>&1 \
+       && command -v rpmlint >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1' >/dev/null 2>&1
+}
+if [ -n "${T4_RPM_IMAGE:-}" ]; then
+  # An explicit choice is never second-guessed: it is provisioned, or the run stops here.
+  if ! image_ready "$IMAGE"; then
+    printf '\n%sFATAL%s T4_RPM_IMAGE=%s carries no rpmbuild/rpmspec/rpmlint/zstd, so the measurement\n' \
+      "$C_ER" "$C_0" "$IMAGE" >&2
+    printf '       run would collect nothing. Point it at a provisioned image (see the header).\n' >&2
+    exit 1
+  fi
+elif image_ready "$IMAGE"; then
+  : # a fedora:41 that already has them (someone provisioned it): use it as it is
+elif image_ready darling-rpm-gates:fc41; then
+  printf '%snote%s %s is bare: using the prebuilt gate image darling-rpm-gates:fc41\n' \
+    "$C_B" "$C_0" "$IMAGE"
+  IMAGE=darling-rpm-gates:fc41
+else
+  printf '%snote%s %s is bare: building darling-rpm-gates:fc41 once (dnf -y install ...)\n' \
+    "$C_B" "$C_0" "$IMAGE"
+  cat > "$WORK/gate-image.Dockerfile" <<DOCKERFILE
+FROM $IMAGE
+RUN dnf -y install rpm-build rpmlint xz diffutils binutils zstd \
+  && dnf clean all
+DOCKERFILE
+  if ! "$DOCKER" build -t darling-rpm-gates:fc41 -f "$WORK/gate-image.Dockerfile" "$WORK" >&2; then
+    printf '\n%sFATAL%s could not provision the gate image (network? dnf?): nothing was measured.\n' \
+      "$C_ER" "$C_0" >&2
+    exit 1
+  fi
+  IMAGE=darling-rpm-gates:fc41
+fi
+chk "the image carries rpmbuild, rpmspec, rpmlint and zstd" \
+  "$(image_ready "$IMAGE" && echo yes)" "yes"
+
 # The shipped render, on THIS box, with no rpm toolchain at all: run before the container so a box
 # with no rpm still proves what CI will ship -- and prove the shipped arch is x86_64 while the
 # fixture is free to be rewritten. --render-only stops after step 7 (specs + sources, no rpmbuild).
 mkdir -p "$O" "$HO" "$HOSTDIST"
 # SOURCE_DATE_EPOCH pins the %changelog date (C54) so the shipped render is a literal rather than
 # "whatever day the gate ran", exactly like the container's own shipped render -- the two are
-# compared byte-for-byte below.
+# compared byte-for-byte below. The fixture tag is pinned for both, in the one place this harness
+# keeps it (FIXTURE_TAG): the builders derive their own default from the checkout, and this copy of
+# packaging/ has no .git, so an unpinned side would render the 0.0.0 development form.
 ( cd "$SRC" && DARLING_PKG_DIST="$HOSTDIST" SOURCE_DATE_EPOCH=1700000000 \
+    TAG="$FIXTURE_TAG" RPM_FIXTURE_TAG="$FIXTURE_TAG" \
     sh packaging/common/build-rpm.sh fixture --render-only ) \
   > "$HO/host-render.log" 2>&1
 echo $? > "$HO/host-render.rc"
@@ -284,6 +341,12 @@ arch=$(uname -m)
 case $arch in x86_64) fixarch= ;; *) fixarch=$arch ;; esac
 printf '%s\n' "${fixarch:--}" > "$OUT/fixture-arch.txt"
 export RPM_FIXTURE_ARCH=$fixarch
+
+# The fixture tag: the harness owns the literal, build-rpm.sh derives its own default
+# (pkg-version.sh -> git describe, and this copy of packaging/ has no .git). Pinned here for the
+# same reason run-deb-gates.sh pins TAG=v0.1.0 -- so the rows below assert an exact version, and so
+# the host render-only run above and this container's runs render the SAME bytes.
+export RPM_FIXTURE_TAG="$FIXTURE_TAG"
 
 # --- the negative-control hook: break the OBJECT, and prove the break is real -------------------
 BRK=${T4_GATES_BREAK:-}
@@ -617,6 +680,7 @@ IN_CONTAINER
 [ -n "$QUIET" ] || printf '  running %s %s (one measurement run: build, queries, rpmlint, install)\n' "$DOCKER" "$IMAGE"
 if ! "$DOCKER" run --rm -v "$WORK:/work" -v "$SRC:/src" \
      -e "T4_GATES_BREAK=$BREAK" -e "T4_HOST_UID=$(id -u)" -e "T4_HOST_GID=$(id -g)" \
+     -e "FIXTURE_TAG=$FIXTURE_TAG" \
      "$IMAGE" bash /work/in-container.sh > "$WORK/container.log" 2>&1; then
   sk "the container run did not exit 0 -- see the copy of the log in $O/container.log"
   no "G-RPM-0 the container measurement run exits 0"
@@ -862,9 +926,9 @@ sa "and no runtime path leaked into it (the split is one path, one owner)" \
 # satisfy either count. No literal count: both sides are the staged manifest's own size plus the two
 # %doc files %install adds, so T1 growing the launcher's file set cannot redden these by accident.
 sa "the launcher's payload metadata covers every path the package owns (staged + the two %doc files)" \
-  "$(cnt dump-launcher.txt)" "$(( $(cnt stage-files.launcher) + 2 ))"
+  "$(cnt dump-launcher.txt)" "$(( $(cntn stage-files.launcher) + 2 ))"
 sa "and every one of those modes is 0644 or 0755: this spec has no hardened path, so Source0's own modes stand" \
-  "$(num dump-launcher.txt ' (0100644|0100755) ')" "$(( $(cnt stage-files.launcher) + 2 ))"
+  "$(num dump-launcher.txt ' (0100644|0100755) ')" "$(( $(cntn stage-files.launcher) + 2 ))"
 end_row "G-RPM-2 the launcher rpm owns exactly its staged paths plus the two %doc files"
 
 sec "G-RPM-3  the metadata a broken install would hide (requires, conflicts, caps, %post)"

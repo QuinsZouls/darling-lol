@@ -23,7 +23,8 @@
 #   DARLING_PKG_DIST   absolute dist/ directory (default: <repo>/dist) -- the same variable
 #                      scripts/build-packaging.sh honours, so both share one layout
 #   RPMBUILD           the rpmbuild program (default: whatever rpmbuild is on $PATH)
-#   RPM_FIXTURE_TAG    the tag fixture mode versions itself with (default: v0.1.0)
+#   RPM_FIXTURE_TAG    the tag fixture mode versions itself with; default: the exported TAG,
+#                      else the checkout's own version (pkg-version.sh -> git describe)
 #   RPM_FIXTURE_ARCH   FIXTURE MODE ONLY, and only when the host cannot build the shipped arch:
 #                      it rewrites the single `ExclusiveArch:` line of the rendered runtime spec.
 #                      Measured: `ExclusiveArch: x86_64` on an aarch64 host is a hard rpmbuild
@@ -120,7 +121,11 @@ command -v zstd >/dev/null 2>&1 || fatal "zstd not found on PATH.
 # --- 2. the staged tree: fixture mode produces one, the real mode requires one -----------------
 mkdir -p "$pkg"
 if [ "$arg" = fixture ]; then
-  tag=${RPM_FIXTURE_TAG:-v0.1.0}
+  # The fixture tag is what the run was given (RPM_FIXTURE_TAG, else the exported TAG that
+  # build-all.sh sets) and otherwise the checkout's own version -- the same single derivation the
+  # production path uses (pkg-version.sh -> git describe). packaging/common/ never carries a
+  # literal version (G-STATIC); a git-less copy still renders the 0.0.0 dev form.
+  tag=${RPM_FIXTURE_TAG:-${TAG:-$(sh "$dir/pkg-version.sh")}}
   note "fixture mode: staging the hostile-shape tree with packaging/testdata/mkfixture.sh"
   # mkfixture gets the pkg dir itself, so the fixture's DESTDIR is $pkg/root -- exactly where the
   # real build puts it. That is what makes the two modes share the artifacts (and the paths in
