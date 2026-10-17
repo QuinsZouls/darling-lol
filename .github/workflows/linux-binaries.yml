@@ -12,6 +12,13 @@ name: Linux binaries
 #     `publish-release` job then promotes that build's artifacts unchanged (minutes,
 #     no rebuild, and the released files are exactly the ones that were validated).
 #
+# The distro packages (.deb / .rpm / .pkg.tar.zst / .tar.zst / SHA256SUMS) ride the same release,
+# behind a second, opt-in input: `packages=true` runs the `package` job — a SECOND full build, at
+# prefix /usr — and attaches its assets to the release of `tag`. Nothing new starts on a push, a PR
+# or a tag push. The one-dispatch way to ship binaries AND packages:
+#
+#   gh workflow run linux-binaries.yml -f build=true -f packages=true -f tag=v0.1.2
+#
 # Binaries are NEVER committed to the repository: scripts/validate.py rejects any
 # tracked file that looks binary (ELF/MZ/Mach-O magic, NUL bytes, non-UTF8, or the
 # .so/.dylib/.zip/... suffixes), so the only delivery channels are
@@ -36,6 +43,12 @@ on:
         description: 'Release tag to create from this build (e.g. v0.1.0). Empty = build only, no release.'
         type: string
         default: ''
+      packages:
+        # Off by default, and that is load-bearing: the heavy build must never start on its own
+        # (brief §5.4). This input adds a SECOND full build, at prefix /usr.
+        description: 'Also build the distro packages (.deb/.rpm/.pkg.tar.zst/.tar.zst + SHA256SUMS) and attach them to the release. Adds a second full build (1-2 h) at prefix /usr.'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -97,6 +110,7 @@ jobs:
           # Passed through the environment and never interpolated into the script: the input
           # is free text and `${{ ... }}` inside `run:` would be evaluated as shell code.
           TAG: ${{ github.event.inputs.tag }}
+          INPUT_PACKAGES: ${{ github.event.inputs.packages }}
         run: |
           set -euo pipefail
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -111,6 +125,16 @@ jobs:
           # Fail closed: only "(HTTP 404)" means the tag is free. 401/403/5xx/network errors
           # must stop the run instead of being read as "available".
           if probe=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>&1); then
+            # The tag exists. That is the REFRESH case of the packaging flow (PLAN 17.4a):
+            # re-dispatching a published tag is how the distro packages get attached to a release
+            # that was cut before them (the packages builders need a second, /usr build that the
+            # original release never had). Allowed ONLY when `packages` is ticked: a plain
+            # re-dispatch of a published tag would silently rebuild and replace published
+            # binaries, which is exactly what "choose the next version" exists to prevent.
+            if [ "$INPUT_PACKAGES" = 'true' ]; then
+              echo "::warning::tag '$TAG' already exists and packages=true: refreshing the release's assets in place. The tag is NOT moved, and the packages are built from $GITHUB_SHA, not from the tag."
+              exit 0
+            fi
             echo "::error::tag '$TAG' already exists; choose the next version"; exit 1
           fi
           case "$probe" in
@@ -220,6 +244,9 @@ jobs:
           # steps ran, and a promoted release artifact must state its variant.
           INPUT_BUILD: ${{ github.event.inputs.build }}
           INPUT_RUNTIME_OVERRIDES: ${{ github.event.inputs.runtime_overrides }}
+          # Read by the BUILD-INFO.txt block below to tell a refresh (an existing tag) from a
+          # normal run (PLAN 17.4a).
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
           # The installed tree is tarred right here, immediately after the build and on the
@@ -295,9 +322,22 @@ jobs:
             -T build/runtime-artifact-files.txt
 
           # Build metadata.
+          #
+          # PLAN 17.4a: a dispatch on a *branch* can publish an existing tag (that is the refresh
+          # path the packaging flow needs), and then this run's checkout is NOT the tag's commit.
+          # `commit:` keeps its old meaning -- what this run checked out and built -- and
+          # `runtime-commit:` records the tag's commit, i.e. the commit the release is presented
+          # as, so nobody has to guess which of the two a published asset refers to. They are equal
+          # on a normal run (where this step also creates the tag) and differ only on a refresh.
+          runtime_commit=$GITHUB_SHA
+          if [ -n "${INPUT_TAG:-}" ] && git rev-parse -q --verify "refs/tags/$INPUT_TAG" > /dev/null; then
+            runtime_commit=$(git rev-list -n1 "$INPUT_TAG")
+          fi
+
           {
             echo "repo: $GITHUB_REPOSITORY"
             echo "commit: $GITHUB_SHA"
+            echo "runtime-commit: $runtime_commit"
             echo "ref: $GITHUB_REF_NAME"
             echo "components: $(python3 -c "import json;print(len(json.load(open('upstream/manifest.json'))['components']))")"
             echo "install-manifest: $manifest_total files, $manifest_missing missing"
@@ -336,10 +376,18 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-      - name: Create the tag and publish the release
-        # Only when the manual run asked for a tag: `gh release create --target` creates
-        # the tag at the commit that was just built, so the tag can never point at
-        # something that failed to build.
+      - name: Create or refresh the release (idempotent)
+        # Only when the manual run asked for a tag. `gh release create` is NOT idempotent: on a
+        # second run it dies with "release already exists" -- after an hours-long build (C16). This
+        # step is the shape that survives a re-dispatch: probe, create only when there is nothing
+        # to refresh, then upload with `--clobber`. `--clobber` replaces same-named assets and adds
+        # new ones, which is what makes re-dispatching a tag additive instead of destructive.
+        #
+        # 🚨 The probe is FAIL-CLOSED, exactly like the tag pre-flight above: only gh's own
+        # "release not found" (an HTTP 404) may be read as "absent". A 401/403/5xx or a network
+        # error aborts the run -- reading it as "absent" would turn an expired token into a
+        # `create` attempt that fails for a reason the log no longer names, or (with a token that
+        # is merely under-privileged) into a second release.
         if: github.event.inputs.tag != ''
         shell: bash
         env:
@@ -347,11 +395,405 @@ jobs:
           TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$TAG" \
-            --notes "Linux x86-64 binaries for $TAG, built from $GITHUB_SHA by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # The commit the release is presented as. On a refresh dispatch (an existing tag, with
+          # `packages=true`) that is the tag's commit and NOT this run's checkout, which is why
+          # BUILD-INFO.txt above records the two separately (PLAN 17.4a).
+          tag_exists=0
+          runtime_commit=$GITHUB_SHA
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            tag_exists=1
+            runtime_commit=$(git rev-list -n1 "$TAG")
+          fi
+          notes="Linux x86-64 binaries for $TAG, built from $GITHUB_SHA by run $run_url."
+          refresh_notes="Assets for $TAG refreshed by run $run_url; the tag is not moved. A rebuilt
+          asset can differ byte for byte from the one published earlier -- SHA256SUMS is the
+          authority for what this release contains, not a memorised hash. (The .tar.gz is a
+          rebuilt archive: it no longer carries duplicate directory members, so its checksum
+          changed; the extracted tree is identical.)"
+
+          if probe=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1); then
+            exists=1
+          else
+            case "$probe" in
+              *'release not found'* | *'(HTTP 404)'*) exists=0 ;;
+              *) echo "::error::could not tell whether release $TAG exists: $probe"; exit 1 ;;
+            esac
+          fi
+
+          if [ "$exists" = 1 ]; then
+            echo "release $TAG exists; refreshing its assets in place (the tag is not moved)"
+            if [ "$runtime_commit" != "$GITHUB_SHA" ]; then
+              # This run publishes an *existing* tag from a different commit, so the assets below
+              # replace published ones: whoever pinned a checksum has to be told (PLAN 18.3).
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$refresh_notes"
+            fi
+          elif [ "$tag_exists" = 1 ]; then
+            # Tag present, release absent. `--verify-tag` makes a typo'd tag fail loudly instead of
+            # creating a release that points at the wrong commit.
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes "$notes" \
+              --verify-tag
+          else
+            # Neither: create the tag at the commit that was just built, so the tag can never
+            # point at something that failed to build. `--target` is what creates it.
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes "$notes"
+          fi
+
+          # Directories are filtered out on purpose: `gh release upload` takes files, and dist/
+          # carries the staging tree (dist/pkg) in the `package` job.
+          assets=()
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            assets+=("$f")
+          done
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::nothing to publish in dist/"; exit 1; }
+          gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+          # Report what the release now holds, so a partial upload is visible in the log instead of
+          # having to be inferred from the release page.
+          echo "assets on $TAG:"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "  \(.name)\t\(.size)"'
+
+  # The distro packages: `darling-lol_<ver>_amd64.deb` + the launcher `.deb` (T3), the two `.rpm`
+  # (T4), the `.pkg.tar.zst` pair (T6), the release `.tar.zst`/`.tar.gz` and SHA256SUMS (T6) — all
+  # from ONE staging tree, through `packaging/common/build-all.sh`, which re-implements nothing and
+  # is the single entry point for the release asset set (PLAN §17.2).
+  #
+  # This is a SECOND full build, at prefix /usr: LIBEXEC_PATH is a compile-time string inside
+  # darlingserver with no environment override, so relocating the published /usr/local artifact
+  # produces a runtime that installs clean and dies in mount("overlay") (C7). It is ON-DEMAND
+  # only — `packages` defaults to false, so no push, no PR and no tag push ever starts it
+  # (brief §5.4).
+  package:
+    name: Build the distro packages (prefix /usr)
+    # Never on a tag push: a tag push stays the cheap "promote the validated artifacts" path, and
+    # this job is hours long.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.packages == true }}
+    # PLAN §2/§17.2 writes this as `needs: build`, but no job of that name exists in this
+    # workflow: the heavy /usr/local job is `linux-binaries`. Same intent — the packages ride the
+    # run whose binaries they accompany, so `packages=true` implies `build=true` (the documented
+    # one-dispatch line ticks both) and a release can never end up with packages and no binaries.
+    # It is also the ordering that keeps the two release-writers from racing: `linux-binaries`
+    # creates (or refreshes) the release hours earlier, and this job only ever uploads into it.
+    needs: linux-binaries
+    # PINNED, not ubuntu-latest: `packaging/common/deps.deb.noble` names the noble packages, and
+    # those names drift under 26.04 (PLAN §21, R10).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    # `contents: write` is for the LAST step alone, which attaches the packages to the release
+    # `tag` names. It cannot be delegated to `publish-release`: in the one-dispatch flow the tag is
+    # created by the `linux-binaries` job through the API, and a tag created that way emits no
+    # `push` event — so the promotion path (PLAN §17.3, which assumed it would run) never fires and
+    # this job is the only publisher the packages have.
+    permissions:
+      contents: write
+    # Keyed on the ref, so cancelling a dispatch cancels this job and the build with it, and two
+    # dispatches on different refs do not queue behind each other (PLAN §17.5).
+    concurrency:
+      group: ${{ github.workflow }}-package-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      # build-packaging.sh, stage.sh and build-all.sh all default to ${GITHUB_WORKSPACE}/dist;
+      # pinning it keeps ONE absolute dist/ whatever a step's cwd happens to be.
+      DARLING_PKG_DIST: ${{ github.workspace }}/dist
+    steps:
+      # fetch-depth 0: pkg-version.sh derives every format's version from the tags.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Same as the `linux-binaries` job: a full Darling build needs tens of GB, and the 40 GB
+      # floor checked below has to be about the runner as it actually is.
+      - name: Free disk space
+        shell: bash
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+          du -sh .
+
+      # Cheap pre-flight, before the hours-long build (PLAN §17.2, R1). Failing here costs
+      # seconds; failing at 90 % of the build costs the whole run.
+      - name: Check the runner has the room
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          avail=$(df -Pk / | awk 'NR==2{print $4}')
+          # The build tree (Darling is tens of GB) plus the /usr staging tree plus four package
+          # formats. 40 GB is the plan's floor.
+          if [ "$avail" -lt 40000000 ]; then
+            echo "::error::only $((avail/1024/1024)) GB free; need ~40 GB"; exit 1
+          fi
+
+      # --- the environment the `linux-binaries` job sets up ------------------------------------
+      # This job IS a second full build, so it needs everything that job installs. The block is
+      # duplicated by hand: steps cannot be shared between jobs, and the alternatives (a composite
+      # action, a reusable workflow) mean touching the job the release path is already validated
+      # against. Keep the two in sync.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install the base toolchain
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git git-lfs cmake make clang lld build-essential pkg-config bison flex \
+            xz-utils unzip curl ca-certificates python3-venv
+          git lfs install --skip-repo
+
+      - name: Configure the checkout
+        run: |
+          python3 scripts/configure.py --guest-user runner
+          python3 -m venv build/venv
+          build/venv/bin/pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Fetch the pinned Darling sources and apply the patches
+        # build-packaging.sh runs prepare.py again later, as a no-op on a prepared tree; this
+        # explicit step exists so the pinned debian/control is available to the dependency step
+        # below.
+        run: python3 scripts/prepare.py
+
+      - name: Install the pinned build dependencies
+        shell: bash
+        run: |
+          sudo apt-get install -y --no-install-recommends devscripts equivs debhelper
+          # The fork has no debian/ directory of its own: the pinned upstream control
+          # file only exists once prepare.py has cloned build/darling-src.
+          if ! sudo mk-build-deps --install --remove \
+               --tool 'apt-get --no-install-recommends -y' \
+               build/darling-src/debian/control; then
+            echo "::warning::mk-build-deps failed; falling back to an explicit apt dependency list"
+            sudo apt-get install -y --no-install-recommends \
+              cmake clang lld bison flex pkg-config libfuse-dev libudev-dev \
+              libcairo2-dev libgl1-mesa-dev libtiff-dev libfreetype-dev libelf-dev \
+              libxml2-dev libegl1-mesa-dev libglu1-mesa-dev libfontconfig1-dev \
+              libbsd-dev libxrandr-dev libxcursor-dev libgif-dev libavcodec-dev \
+              libavformat-dev libswresample-dev libavutil-dev libpulse-dev \
+              libdbus-1-dev libxkbfile-dev libcap-dev libcap2-bin llvm-dev \
+              libvulkan-dev libx11-dev libxext-dev libx11-xcb-dev libxcb-shm0-dev
+          fi
+
+      # --- the packaging tools (PLAN §17.2) ----------------------------------------------------
+      - name: Install the packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # debhelper is NOT needed (the builders call dpkg-deb directly, PLAN §9) but devscripts
+          # is, for dpkg-shlibdeps if T7 ever re-enables it. libarchive-tools = bsdtar (Arch),
+          # lintian for G-DEB-4, zstd for the .tar.zst payloads, xz-utils for the .deb -Zxz, rpm
+          # for rpmbuild, shellcheck for G-STATIC-1.
+          sudo apt-get install -y --no-install-recommends \
+            devscripts lintian libarchive-tools zstd xz-utils rpm shellcheck
+          # Every one of these is load-bearing, and `command -v` costs nothing here: a missing
+          # bsdtar does not fail until the Arch builder runs, an hour into the job.
+          for c in dpkg-deb rpmbuild bsdtar zstd lintian shellcheck sha256sum; do
+            command -v "$c" > /dev/null || { echo "::error::$c is missing"; exit 1; }
+          done
+
+      # T10 (§16) owns the installer; this job only publishes it as the release asset
+      # `darling-lol-install.sh`, which `build-tar.sh` refuses to build the asset set without
+      # (PLAN §12.2, and it is what `install.sh` is fetched as). Checked BEFORE the build: a
+      # missing installer is a broken pipeline, and learning that two hours in is the expensive
+      # version of the same news.
+      - name: Stage the release installer asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=packaging/install/darling-lol-install.sh
+          [ -f "$src" ] || {
+            echo "::error::$src is missing: the release asset set requires dist/darling-lol-install.sh (PLAN §12.2/§16.1). It is T10's deliverable -- this job only publishes it. If T10 ships it under a different name, this one line is the fix."
+            exit 1
+          }
+          mkdir -p dist
+          cp -p "$src" dist/darling-lol-install.sh
+          ls -l dist/darling-lol-install.sh
+
+      - name: Download the reference manifest (drift gate G-PKG-1)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Best-effort on purpose: the v0.1.0 manifest is what stage.sh diffs this tree against
+          # and its absence is a warning, never a failed build (PLAN §17.2). The `if` is inside the
+          # step rather than an action-level `continue-on-error` so that the warning names the
+          # reason and a broken token is still visible in the log.
+          mkdir -p dist/pkg/ref
+          if gh release download v0.1.0 --repo "$GITHUB_REPOSITORY" \
+               --pattern 'installed-files.txt' --pattern 'BUILD-INFO.txt' \
+               --dir dist/pkg/ref; then
+            ls -l dist/pkg/ref
+          else
+            echo "::warning::no v0.1.0 reference release; skipping the G-PKG-1 drift gate"
+          fi
+          if [ -f dist/pkg/ref/installed-files.txt ]; then
+            cp dist/pkg/ref/installed-files.txt dist/pkg/reference-installed-files.txt
+          fi
+
+      - name: Build the runtime at prefix /usr
+        shell: bash
+        run: |
+          set -euo pipefail
+          # scripts/build-packaging.sh owns the build AND the DESTDIR install into
+          # $DARLING_PKG_DIST/pkg/root, so the four packaging flags live in exactly one place and
+          # this workflow never inlines a cmake flag (PLAN §3.3). Its install-log assertions
+          # (G-PKG-2) run inside it, and its own pre-flight refuses a non-empty staging tree — a
+          # reused tree is D1's silent failure mode.
+          JOBS="$(nproc)" sh scripts/build-packaging.sh
+
+      - name: Stage the tree and build every format
+        shell: bash
+        env:
+          # Provenance for BUILD-INFO-packages.txt (PLAN §12.3). `build-all.sh` passes its
+          # environment through to `build-info.sh`, whose defaults are wrong in CI: `COMMIT` and
+          # `REF` would be read off a detached checkout, `RUN` would say "local", and `inputs:`
+          # would say "unknown". The schema §12.3 documents names the dispatch's inputs, so all
+          # three are recorded.
+          INPUTS: build=${{ inputs.build }} runtime_overrides=${{ inputs.runtime_overrides }} packages=${{ inputs.packages }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Through the environment, never interpolated into `run:`: the input is free text, and
+          # `${{ ... }}` inside a script would be evaluated as shell code. (The linux-binaries job's
+          # tag pre-flight validates its shape, but that is a second line of defence, not this one.)
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # `build-all.sh` takes the tag as a POSITIONAL argument -- `TAG=` in the environment is
+          # read in fixture mode only and re-exported by the script itself, so it is not a way to
+          # pass it here. An empty input (a build-only dispatch) means "derive the version from the
+          # checkout", which is what pkg-version.sh does with `git describe --tags --always`.
+          tag="${INPUT_TAG:-$(git describe --tags --always)}"
+          # stage.sh runs FIRST and is not optional: it writes files.all / files.quoted /
+          # files.emptydirs / files.runtime / files.launcher plus the counts, it runs the
+          # G-PREFIX-1 content sweep, and it is what produces the G-PKG-1 drift diff against the
+          # v0.1.0 reference. build-all.sh's production mode refuses to start without those lists.
+          # Its two paths are positional too; passing them explicitly is what keeps it pointed at
+          # $DARLING_PKG_DIST and not at a `dist/` relative to some other cwd.
+          sh packaging/common/stage.sh "$DARLING_PKG_DIST/pkg/root" "$DARLING_PKG_DIST/pkg"
+          # The drift diff's own length is one of §12.3's keys, and only stage.sh's output knows
+          # it. Absent (no reference release) means the diff never ran, which is build-info.sh's
+          # own default of 0.
+          if [ -s "$DARLING_PKG_DIST/pkg/prefix-diff.txt" ]; then
+            export REFERENCE_DIFF_LINES
+            REFERENCE_DIFF_LINES=$(wc -l < "$DARLING_PKG_DIST/pkg/prefix-diff.txt")
+          fi
+          sh packaging/common/build-all.sh "$tag"
+
+      # (PLAN §17.6, T11) `verify-packages.sh` installs every published format in a throwaway
+      # container and asserts the result: G-VERIFY-1..5, the gate that makes the setuid,
+      # dependency and file-count claims MEASURED rather than declared. It is not wired in here
+      # because the script does not exist yet (T11 owns it). When it lands, add, after the step
+      # above:
+      #     - name: Verify the packages in containers (D7)
+      #       run: .github/workflows/verify-packages.sh dist
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: darling-lol-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/*.tar.zst
+            dist/*.tar.gz
+            dist/darling-lol-install.sh
+            dist/SHA256SUMS
+            dist/BUILD-INFO-packages.txt
+            dist/rpmlint.toml
+            dist/pkg/prefix-diff.txt
+            dist/pkg/count.*
+          if-no-files-found: error
+          retention-days: 30
+
+      # Only when this dispatch was asked to cut a release. `publish-release` covers the other
+      # order (build first, tag later, assets promoted unchanged); this step covers the ONE-dispatch
+      # order, where the tag — and the release — were created by the `linux-binaries` job minutes
+      # ago and no `push` event will ever fire for them.
+      #
+      # 🚨 Same fail-closed probe and same `--clobber` semantics as that job's release step, so
+      # `gh` failing for a real reason (401/403/5xx, network) aborts instead of being read as
+      # "release absent". `dist/*` is filtered to files: dist/ also holds the staging tree.
+      - name: Attach the packages to the release (idempotent)
+        if: github.event.inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          runtime_commit=$GITHUB_SHA
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            runtime_commit=$(git rev-list -n1 "$TAG")
+          fi
+          notes="Distro packages and release tarballs for $TAG, built from $GITHUB_SHA by run $run_url."
+          refresh_notes="Assets for $TAG refreshed by run $run_url; the tag is not moved. A rebuilt
+          asset can differ byte for byte from the one published earlier -- SHA256SUMS is the
+          authority for what this release contains, not a memorised hash. (The .tar.gz is a
+          rebuilt archive: it no longer carries duplicate directory members, so its checksum
+          changed; the extracted tree is identical.)"
+
+          if probe=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1); then
+            exists=1
+          else
+            case "$probe" in
+              *'release not found'* | *'(HTTP 404)'*) exists=0 ;;
+              *) echo "::error::could not tell whether release $TAG exists: $probe"; exit 1 ;;
+            esac
+          fi
+
+          if [ "$exists" = 1 ]; then
+            echo "release $TAG exists; refreshing its assets in place (the tag is not moved)"
+            if [ "$runtime_commit" != "$GITHUB_SHA" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$refresh_notes"
+            fi
+          elif git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            # Tag present, release absent: --verify-tag makes a typo'd tag fail loudly.
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes "$notes" \
+              --verify-tag
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes "$notes"
+          fi
+
+          assets=()
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            assets+=("$f")
+          done
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::nothing to publish in dist/"; exit 1; }
+          gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+          echo "assets on $TAG:"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "  \(.name)\t\(.size)"'
 
   # Tagging is the release trigger. This job does NOT rebuild: it promotes the artifacts of
   # the newest successful manual build of this exact commit, so a release takes minutes and
@@ -400,6 +842,26 @@ jobs:
           ls -la dist
           du -sh dist/*
 
+      - name: Download that build's package artifacts, when it produced them
+        # PLAN §17.3. Best-effort, and load-bearing: a tag pushed from a dispatch that did NOT tick
+        # `packages` has no such artifact, and tagging must not break because of that. The download
+        # goes through `gh run download <run_id>` for the same reason the binaries do: the artifact
+        # belongs to the *build* run, not to this tag-triggered one, so an action that downloads
+        # "the current run's artifacts" would silently find nothing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.build.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          if gh run download "$RUN_ID" \
+               --repo "$GITHUB_REPOSITORY" \
+               --name darling-lol-packages \
+               --dir dist; then
+            echo "run $RUN_ID produced the distro packages as well; promoting them too"
+          else
+            echo "::warning::run $RUN_ID has no 'darling-lol-packages' artifact; publishing the binaries only"
+          fi
+
       - name: Check the artifacts really come from this commit
         run: |
           set -euo pipefail
@@ -412,20 +874,44 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.build.outputs.run_id }}
         run: |
           set -euo pipefail
-          # Re-running this job after a late failure must be safe: an existing release gets its
-          # assets refreshed in place instead of failing with "release already exists".
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "::warning::release $GITHUB_REF_NAME already exists; refreshing its assets"
-            gh release upload "$GITHUB_REF_NAME" dist/* \
-              --repo "$GITHUB_REPOSITORY" --clobber
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
+          # Same fail-closed probe as the `linux-binaries` job's release step (C16, PLAN §18.1/18.2):
+          # only gh's "release not found" (an HTTP 404) means the release is absent. A 401/403/5xx
+          # or a network error aborts the run instead of being read as "absent" — which would turn
+          # a broken token into a `create` that fails for an unnamed reason, or into a second
+          # release under a token that is merely under-privileged.
+          if probe=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" 2>&1); then
+            echo "::warning::release $GITHUB_REF_NAME already exists; refreshing its assets in place"
           else
-            notes=$(printf 'Linux x86-64 binaries for %s, promoted unchanged from build run %s.' \
-              "$GITHUB_REF_NAME" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ steps.build.outputs.run_id }}")
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$GITHUB_REF_NAME" \
-              --notes "$notes" \
-              --verify-tag
+            case "$probe" in
+              *'release not found'* | *'(HTTP 404)'*)
+                notes=$(printf 'Linux x86-64 binaries for %s, promoted unchanged from build run %s.' \
+                  "$GITHUB_REF_NAME" "$run_url")
+                gh release create "$GITHUB_REF_NAME" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --title "$GITHUB_REF_NAME" \
+                  --notes "$notes" \
+                  --verify-tag
+                ;;
+              *) echo "::error::could not tell whether release $GITHUB_REF_NAME exists: $probe"; exit 1 ;;
+            esac
           fi
+
+          # `--clobber` replaces same-named assets and adds new ones, so re-running this job after
+          # a late failure is safe and a promoted package set joins the binaries. Directories are
+          # filtered out: the packages artifact carries dist/pkg/ diagnostics.
+          assets=()
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            assets+=("$f")
+          done
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::nothing to publish in dist/"; exit 1; }
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+          echo "assets on $GITHUB_REF_NAME:"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "  \(.name)\t\(.size)"'
