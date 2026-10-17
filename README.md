@@ -45,6 +45,8 @@ Game files, Riot installers, account databases, tokens, local prefixes, captures
 
 Use the dependency list in the [pinned Darling source](https://github.com/darlinghq/darling/tree/60ba801decee7a00782f74f6be4c8ffb013f79ff) for your distribution. `tools/env-check.sh` provides a starting check; its legacy package names may need adapting to your distro.
 
+Prefer not to build? Every release ships ready-made packages (`.deb`, `.rpm`, `.pkg.tar.zst`) and one installer for everything else — see [packaging and installing from a release](docs/PACKAGING.md).
+
 ## Build on the other PC
 
 ```sh
@@ -120,7 +122,7 @@ scripts/             portable entry points
 upstream/manifest.json  exact base revisions and patch ownership
 patches/             current source changes, one patch per repository
 tools/               runtime templates, installers and standalone regression probes
-docs/                setup, testing, status and licensing notes
+docs/                setup, testing, status, packaging and licensing notes
 build/               local sources, outputs and rendered tools (ignored)
 ```
 

@@ -1,0 +1,9 @@
+# The G-INSTALL-2b fixture: Linux Mint 22 (Wilma), an Ubuntu derivative. Its VERSION_ID is MINT's
+# (22), not Ubuntu's, so the release must come from UBUNTU_CODENAME (noble) -- NIT-2.
+NAME="Linux Mint"
+VERSION="22 (Wilma)"
+ID=linuxmint
+ID_LIKE="ubuntu debian"
+VERSION_ID="22"
+VERSION_CODENAME=wilma
+UBUNTU_CODENAME=noble

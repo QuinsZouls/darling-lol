@@ -1,0 +1,6 @@
+# The G-INSTALL-2b fixture: Fedora 41 -- RELEASE is fc${VERSION_ID%%.*}.
+NAME="Fedora Linux"
+VERSION="41 (Workstation Edition)"
+ID=fedora
+VERSION_ID=41
+VERSION_CODENAME=""

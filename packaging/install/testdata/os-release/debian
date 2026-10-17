@@ -1,0 +1,6 @@
+# The G-INSTALL-2b fixture: Debian 12 (bookworm) -- no ID_LIKE, VERSION_CODENAME is the release.
+NAME="Debian GNU/Linux"
+VERSION="12 (bookworm)"
+ID=debian
+VERSION_ID="12"
+VERSION_CODENAME=bookworm

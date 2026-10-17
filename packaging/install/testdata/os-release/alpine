@@ -1,0 +1,5 @@
+# The G-INSTALL-2b refusal fixture: Alpine has no family this installer knows, so it must die
+# with the `--method tar` hint (G-INSTALL-6 asserts the same in a container).
+NAME="Alpine Linux"
+ID=alpine
+VERSION_ID=3.21.0

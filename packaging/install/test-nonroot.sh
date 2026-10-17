@@ -103,6 +103,10 @@ done
 #      is unknown, refused, or implemented.
 #      🚨 rev 5: this loop ran four cases. The two that passed a rootless flag were deleted with
 #      the flag (2026-10-16 ruling, §23), and the mutant they existed to catch (NR2d) with them.
+#      🚨 T10b/NIT-3: the exit status is pinned to 1, not "non-zero". Both flags die in require_root
+#      (step 2 -- before resolve_prefix and before any --dry-run branch), so 1 is the only correct
+#      status, and a mutant that gets out with 127 ("command not found") must be red here too instead
+#      of being caught by loop (i) alone. It is still the $HOME invariant that this loop exists for.
 for hf in "--prefix $HOME_AFTER/x" "--prefix $HOME_AFTER/x --method tar"; do
   reset_home
   set +e
@@ -110,7 +114,7 @@ for hf in "--prefix $HOME_AFTER/x" "--prefix $HOME_AFTER/x --method tar"; do
   out=$(as_uid "$HOME_AFTER" $hf 2>&1)
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || { echo "G-INSTALL-7[$hf]: exited 0 -- nothing may install into \$HOME as a non-root user"; fail=1; }
+  [ "$rc" -eq 1 ] || { echo "G-INSTALL-7[$hf]: exit=$rc, expected 1 (require_root) -- nothing may install into \$HOME as a non-root user"; fail=1; }
   leftover=$(find "$HOME_AFTER" -mindepth 1 -maxdepth 1 ! -name tmp -print 2>/dev/null)
   if [ -n "$leftover" ]; then
     echo "G-INSTALL-7[$hf]: wrote into \$HOME as a non-root user:"

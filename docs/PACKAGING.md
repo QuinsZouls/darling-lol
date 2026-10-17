@@ -8,11 +8,17 @@ One line each, because the rest of the document is the detail:
 * **Debian/Ubuntu/Fedora/Arch** — `sudo bash darling-lol-install.sh --version v0.1.2` picks the
   family's package manager.
 * **Anything else** — `sudo bash darling-lol-install.sh --version v0.1.2 --method tar` unpacks the
-  release tarball under `/usr/local`.
+  release tarball under `/usr` (the same prefix the packages use).
 * **Root is required, and there is no flag for it** — see [Installing without root is not
   supported](#installing-without-root-is-not-supported).
 
 ## What a release carries
+
+The set below is what a `packages=true` dispatch publishes (`.github/workflows/linux-binaries.yml`,
+the "Upload the packages" step): the four package formats, the runtime tree in both compressors, the
+installer and the job's own diagnostic files. On a tag whose packages have not been promoted yet (the
+state of v0.1.2 as this document is written — T11/PR-6 owns the promotion), the release carries only
+the build job's files and the legacy pair.
 
 | asset | what it is |
 |---|---|
@@ -20,11 +26,13 @@ One line each, because the rest of the document is the detail:
 | `darling-lol-launcher_<ver>+lol-1_all.deb` | `/usr/bin/darling-lol` plus the per-user templates and the Riot tools. Under 1 MB |
 | `darling-lol-<ver>-1.lol.fc41.x86_64.rpm`, `darling-lol-launcher-<ver>-1.lol.fc41.noarch.rpm` | the same two packages for Fedora |
 | `darling-lol-<ver>-1-x86_64.pkg.tar.zst`, `darling-lol-launcher-<ver>-1-any.pkg.tar.zst` | the same two packages for Arch |
-| `darling-lol-<ver>-linux-x86_64.tar.zst`, `...tar.gz` | the runtime as one tree, for a distribution with no package |
-| `darling-lol-install.sh` | the installer described here |
-| `SHA256SUMS` | one checksum line per asset above |
-| `BUILD-INFO-packages.txt` | provenance: the commit, the tag, the cmake line, the payload counts |
-| `install.log`, `installed-files.txt`, `BUILD-INFO.txt` | the install manifest and log of the tree |
+| `darling-lol-<ver>-linux-x86_64.tar.zst`, `...tar.gz` | the runtime as one **`/usr`** tree, for a distribution with no package |
+| `darling-lol-install.sh` | the installer described here. It is the release asset; the tarballs carry exactly the tree (see [Re-dispatching a tag](#re-dispatching-a-tag-what-happens-to-the-published-assets)) |
+| `SHA256SUMS` | one checksum line per asset **`packaging/common/build-tar.sh` sums** — the four package formats, the two tarballs and `darling-lol-install.sh`. ⚠️ the build job's files below (`install.log`, `installed-files.txt`, `BUILD-INFO.txt`) have **no** line, so `sha256sum -c SHA256SUMS` needs `--ignore-missing` when they are present |
+| `BUILD-INFO-packages.txt` | provenance of the packages job: the commit, the tag, the cmake line, the payload counts |
+| `rpmlint.toml`, `pkg/prefix-diff.txt`, `pkg/count.*` | the rpm lint config, the `/usr`-vs-`/usr/local` drift diff and the runtime/launcher file counts — the packages job's diagnostic set |
+| `darling-lol-linux-x86_64-<ref>-base-runtime.tar.gz`, `...-runtime-artifacts.tar.gz` | **the legacy v0.1.0-era pair** (e.g. `<ref>` = `v0.1.2`). It is a **`/usr/local`** tree, it is what the loader's `DARLING_SDK` candidate list still accepts, and the installer **never** selects it: its name does not match `darling-lol-<ver>-linux-x86_64.tar.gz` |
+| `install.log`, `installed-files.txt`, `BUILD-INFO.txt` | the **build** job's install log and cmake's `installed-files.txt` (39 007 absolute `/usr/local/...` lines, from the `/usr/local` tree). Do **not** use it as the tarball's manifest — the installer records its own list, see [Uninstall](#uninstall) |
 
 The two packages are always installed together: the launcher hardcodes `--sdk /usr/libexec/darling`
 and `Depends` on the runtime. Nothing on the host should link against Darling's guest libraries, so the
@@ -67,7 +75,7 @@ build about the rpm's `%dist` token or the deb revision.
 
 An unprivileged install cannot satisfy the runtime: the prefix is compiled into
 `LIBEXEC_PATH`/`INSTALL_PREFIX` (there is no run-time override), so the runtime needs a system tree
-(`/usr` for the packages, `/usr/local` for the tarball), and `/usr/bin/darling` must be setuid root
+(`/usr`, for the packages *and* for the `--method tar` tree), and `/usr/bin/darling` must be setuid root
 (mode `4755`) because it is the privilege boundary for the mount namespace and the overlayfs; on top of
 that, `/usr/lib/binfmt.d/darling.conf` is only read from a system path, so registering the Mach-O
 handler is a system-wide change.
@@ -143,10 +151,10 @@ To delete that state by hand — only if you want the runtime rebuilt from scrat
 rm -rf ~/.darling ~/.local/share/darling-lol
 ```
 
-If you have installed the packages *and* an older `/usr/local` tree before, the runtime's own prefix
-records which SDK it was created with (`~/.darling/etc/build`). The installer checks that file, reports
-a prefix whose SDK no longer exists, and prints the two commands that fix it (`darling destroy`, or the
-`rm -rf` above). It never deletes the prefix itself.
+If you have installed the packages *and* an older (v0.1.0-era) `/usr/local` tree before, the
+runtime's own prefix records which SDK it was created with (`~/.darling/etc/build`). The installer
+checks that file, reports a prefix whose SDK no longer exists, and prints the two commands that fix it
+(`darling destroy`, or the `rm -rf` above). It never deletes the prefix itself.
 
 ## Uninstall
 
@@ -164,32 +172,90 @@ sudo dnf remove darling-lol-launcher darling-lol
 # Arch family
 sudo pacman -R darling-lol-launcher darling-lol
 
-# --method tar (a distribution with no package): the payload is one tree, and the release publishes
-# its manifest as installed-files.txt, generated from the same list the build stages. Read the list
-# first -- it is what will be deleted:
-curl -fsSLO https://github.com/QuinsZouls/darling-lol/releases/download/v0.1.2/installed-files.txt
-less installed-files.txt
-sudo sh -c 'while IFS= read -r p; do rm -f -- "/usr/local/$p"; done < installed-files.txt'
-sudo find /usr/local -mindepth 1 -depth -type d -empty -delete
+# --method tar (a distribution with no package): the payload is ONE /usr tree, and the installer
+# records exactly the members it unpacked. Read the list first -- it is what will be deleted:
+sudo less /var/lib/darling-lol/tar-installed-files.txt
+# then run this block as root (paste it into `sudo -s`, or feed it to `sudo sh -s`). It is the
+# same block the install gate executes:
+# G-TAR-UNINSTALL-BEGIN
+members=/var/lib/darling-lol/tar-installed-files.txt
+if [ ! -r "$members" ]; then
+  # No installer record (you unpacked the tarball by hand). The archive's own member list is the
+  # authority -- run this from the directory you downloaded into:
+  members=./darling-lol-members.txt
+  tar -tzf darling-lol-*-linux-x86_64.tar.gz | sed 's|/$||; s|^/*|/|' > "$members"
+fi
+[ -s "$members" ] || { echo "no member list; cd to the download directory first" >&2; exit 1; }
+# 1. the files and symlinks (a directory member is left for step 2)
+while IFS= read -r p; do
+  if [ -d "$p" ] && [ ! -L "$p" ]; then :; else rm -f -- "$p"; fi
+done < "$members"
+# 2. the directories: each member's own path and its parents, deepest first. rmdir removes only an
+#    EMPTY directory, so anything this tree did not put there stops the removal.
+while IFS= read -r p; do
+  d=$p
+  while [ -n "$d" ] && [ "$d" != / ]; do rmdir --ignore-fail-on-non-empty -- "$d" 2>/dev/null; d=${d%/*}; done
+done < "$members"
+# 3. the installer's own record, which is not part of the tree
+rm -rf /var/lib/darling-lol
+# G-TAR-UNINSTALL-END
 ```
+
+The member list is absolute and is used **as it is**: do not prefix it again. (The published
+`installed-files.txt` cannot be used for this — it is cmake's log of a different, `/usr/local` tree,
+and 165 of the paths the `/usr` tree really extracts are absent from it.)
+
+Two-way visibility, since both a package and the tar tree own the same `/usr` paths: the installer
+refuses to run `--method tar` when `dpkg -s darling-lol` succeeds, and re-running it over a previous
+tar install is idempotent (it says so and overwrites). The other order — a package installed over a
+tar tree — is visible at the file level: `dpkg -S /usr/bin/darling` (or `rpm -qf`, `pacman -Qo`) names
+the owner, and after a `--method tar` install it names **nothing**.
 
 Removing the `.deb` also unregisters the Mach-O binfmt handlers it installed, so a removed package does
 not leave the kernel routing Mach-O `execve` calls to a now-deleted `mldr`. Purge (`apt purge`) removes
 the generated configuration as well; the user state above is still untouched by both.
 
-## Re-dispatching a tag: assets rebuilt, `.tar.gz` checksum changed
+## Re-dispatching a tag: what happens to the published assets
 
-Packages were added to a release that already existed, so the same tag (`v0.1.2`) was dispatched again.
-A re-dispatch **rebuilds the tarballs**, so the published `.tar.gz` digest changes even though the
-extracted tree is identical: the new archive no longer carries the duplicate directory members and
-self-referential hard links of the first one (1 239 and 40 of them, measured), which is a defect worth
-fixing. `SHA256SUMS` is republished with the new digests and covers every asset, including this
-installer.
+Packages are added to a release that already exists by dispatching the tag again
+(`linux-binaries.yml` with `packages=true`), and that run rebuilds the archives from the current
+staging tree. What follows from that — and what does **not**:
 
-**Assets rebuilt, `.tar.gz` checksum changed:** if you pinned the old `.tar.gz` SHA256 by hand you will
-see a mismatch, and `SHA256SUMS` — not a memorised hash — is the authority. The `.tar.zst` is new
-(built with `zstd -19`, 92.5 MB against the gzip's 145 MB), and the `.deb`, `.rpm`, `.pkg.tar.zst` and
-`darling-lol-install.sh` are new with this release.
+* `packaging/common/build-tar.sh` names the runtime archives
+  `darling-lol-<ver>-linux-x86_64.tar.zst` and `.tar.gz`. **Neither exists on the v0.1.2 release**, so
+  there is no `.tar.gz` digest that changed. The re-dispatch that *did* happen re-uploaded the two
+  `base-runtime` pairs (one at 16:25Z, one at 17:53Z) — that pair is the **build job's**, from its
+  `/usr/local` staging tree, and it is not a `/usr` archive.
+* **When** the packages job publishes the `.tar.gz`, it is built with `--no-recursion` (the C2 fix) from
+  the same `/usr` tree as the `.deb`/`.rpm`/`.pkg.tar.zst`, so it is byte-different from a pre-fix
+  archive of that tree. Anyone who pinned an old digest will see a mismatch, and `SHA256SUMS` — not a
+  memorised hash — is the authority. This is the plan's intent; it is not a measurement of a published
+  file, because no such file is published yet.
+
+**The legacy pair is still malformed.** Measured on **both** published `base-runtime` archives
+(`darling-lol-linux-x86_64-v0.1.2-base-runtime.tar.gz`, 141 994 619 B, sha256 `402b4052…`, and the
+sibling `…-v0.1.1-1-gcfb89cb-…`, 141 995 849 B — the second upload's digest differs, its structure does
+not): **202 357 members = 146 663 hard links (all self-referential, `name link to name`) + 33 498
+regular files + 20 084 directories + 2 112 symlinks; 39 343 unique names, 37 410 repeated**. That is
+exactly C2, and the re-dispatch did not change it: `--no-recursion` is in `build-tar.sh` and applies to
+the new `darling-lol-<ver>-linux-x86_64.tar.*` archives, not to the legacy pair, which the build job
+produces from a different tree. The `1 239` duplicate members and `40` self-referential hard links
+quoted in the plan are the *same* archive seen through **bsdtar**; GNU tar's histogram is the one above.
+Neither is the pair's own count.
+
+**Assets rebuilt, checksum changed:** if you pinned an old digest by hand you will see a mismatch, and
+`SHA256SUMS` — not a memorised hash — is the authority. The `.tar.zst` is new (built with `zstd -19`,
+92.5 MB); the 145 MB gzip figure it used to be compared against is the published **v0.1.0
+`base-runtime` `.tar.gz`** — a different staging tree, `/usr/local` and the malformed C2 one above —
+not the `.tar.gz` of this `.tar.zst` (which is not published yet). The `.deb`, `.rpm`,
+`.pkg.tar.zst` and `darling-lol-install.sh` are new with this release. `SHA256SUMS` covers the assets
+`build-tar.sh` sums; the build job's `install.log`/`installed-files.txt`/`BUILD-INFO.txt` have no line
+(use `sha256sum -c --ignore-missing`).
+
+`darling-lol-install.sh` is published as its own release asset and is **not** copied into the tarballs
+(each tarball carries exactly the staged tree — one member per `files.all` entry — so an extra member
+would break the archive's own `cmp -s` invariant against its member list; PLAN §16.1(b)'s in-tarball
+copy is superseded by this amendment).
 
 ## Verifying an install
 

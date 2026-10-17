@@ -1,0 +1,5 @@
+# The G-INSTALL-2b fixture: Arch itself sets NO ID_LIKE, so the ID branch must carry it.
+NAME="Arch Linux"
+ID=arch
+BUILD_ID=rolling
+VERSION_ID=20261011.0.609700
