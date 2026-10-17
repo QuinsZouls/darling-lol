@@ -3,8 +3,9 @@
 #
 # A real /usr build cannot be produced on a dev box (the runtime is x86-64 and needs a full
 # cmake build), so the prefix gate is exercised against a fixture that reproduces the byte-level
-# facts the gate asserts: the three host ELFs' string content, the launcher's 4 allowlisted
-# fork files, a T8-fixed installer, guest macOS files that legitimately contain /usr/local, an
+# facts the gate asserts: the three host ELFs' string content, the launcher's allowlisted fork
+# stubs (4 of the 8 names check-prefix.sh allowlists -- the shipped list has 8 since T8c), a
+# T8-fixed installer, guest macOS files that legitimately contain /usr/local, an
 # empty directory, and the Volumes/DarlingEmulatedDrive -> / escape (EVIDENCE C19/§7.5).
 #
 # The host ELFs are *binary* stand-ins (NUL bytes): the host-side text sweep uses `grep -I`,
@@ -63,7 +64,8 @@ prefix_guest() {
   printf '\177ELF\000/usr/local/libexec/darling\000guest\000' > "$_g/usr/lib/libguest.bin"
 }
 
-# prefix_host ROOT -- host-side files, the 4 allowlisted fork files, the T8 fix and the C19 escape.
+# prefix_host ROOT -- host-side files, the launcher's allowlisted fork stubs (4 of the 8 names
+# check-prefix.sh allowlists), the T8 fix and the C19 escape.
 prefix_host() {
   _root=$1
   mkdir -p "$_root/usr/lib/binfmt.d" "$_root/usr/share/darling" \
@@ -75,7 +77,11 @@ prefix_host() {
   printf '%s\n' '#!/bin/sh' '# fixture launcher' > "$_root/usr/bin/darling-lol"
   chmod 0755 "$_root/usr/bin/darling-lol"
   printf '%s\n' '# fixture README-packaging' > "$_root/usr/share/doc/darling-lol/README-packaging.md"
-  # The 4 allowlisted fork-owned files: each keeps its literal /usr/local (PLAN §4.1).
+  # The 4 allowlisted fork stubs THIS FIXTURE writes -- 4 of the 7 fork files the gate allowlists;
+  # the 8th allowlisted name is usr/bin/darling-lol (written above as a 2-line stub), and the 3
+  # remaining tools (metal-presentation, x11-runtime, urlsession-check) are not reproduced here.
+  # Each stub keeps its literal /usr/local (PLAN §4.1). The allowlist itself lives in
+  # check-prefix.sh's ALLOW_PATHS, never here (T8d).
   printf '%s\n' "return {'sdk': '/usr/local/libexec/darling'}" \
     > "$_root/usr/lib/darling-lol/scripts/common.py"
   printf '%s\n' 'sdk = "/usr/local/libexec/darling"' \
