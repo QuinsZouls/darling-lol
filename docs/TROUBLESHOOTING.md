@@ -240,6 +240,7 @@ Exercised on a single-GPU RTX 3060 desktop (driver 615.71, sway with Xwayland), 
 
 - **Black game window, surface.** The compositor subwindow inherited its parent's GLX visual, and NVIDIA's EGL refuses a window surface for a config with another visual (`EGL_BAD_CONFIG`); Mesa accepts the mismatch. The subwindow is now created with the visual of CGL's EGL config (`CGLGetNativeVisualID`).
 - **Black game window, drawing.** The compositor context is first made current without a surface, so its default framebuffer kept `GL_NONE` as draw buffer after a window surface was attached, and NVIDIA discarded every composite. Attaching a new window surface now restores `GL_BACK`. `riot-metal-presentation-check` with `RIOT_PRESENTATION_HOLD=<seconds>` keeps presenting, so the window's real pixels can be read from the host.
+- **Frozen frame over the client.** With CPU readback the local compositor drew Chromium surfaces from a texture loaded once whenever the layer tree was not one full-window surface (the Practice Tool lobby video) and left that frame over the live client. In readback mode it now composites only trees that contain a Metal layer. On sway the client also stays visible during a match, because sway ignores X11 minimize requests.
 
 ### Host-side checks
 
