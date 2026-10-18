@@ -18,13 +18,24 @@
 #                     also pass for a script that always exits 1.
 #
 # 🚨 COUNTED AND PINNED (review salvedad C3). The three halves are COUNTED -- one increment per
-# case that actually ran -- and their totals are PINNED to 10/2/2 by the row `noroot-rows`, and the
+# case that actually ran -- and their totals are PINNED by the row `noroot-rows`, and the
 # summary line prints those counters, never literals. Before this, the OK line was a literal
 # string: a copy of this file with `pacman` (or the whole --dry-run loop) deleted printed the
 # identical "10 refusals" line and exited 0, so the numbers were an assertion rather than a
-# measurement. The pin is FAIL-ONLY: a case that is ADDED must not turn the gate red (an added case
-# is not a defect), a case that DISAPPEARED must. That is what makes `noroot-rows` a rot detector
-# instead of a nuisance.
+# measurement.
+# The pin is FAIL-ONLY, implemented as a FLOOR (`-ge PIN || bad`: fail only when the count is BELOW
+# the pin): a case that is ADDED must not turn the gate red -- extra coverage is not a defect --
+# while a case that DISAPPEARED must. Both directions are measured, not promised:
+# run-mutations.sh's `mx_noroot_add_method` mutant adds a 6th method and expects the gate to stay
+# GREEN with the count at 12, and the four `mx_noroot_drop_*` mutants each delete one case of one
+# half and expect `noroot-rows` to go red.
+# ⚠ The floor deliberately does NOT see a SWAP that keeps a half's count flat (renaming `pacman` to
+# `zypper` still counts 10, and a pristine swapped gate prints the identical OK line). That
+# direction is covered where the names live: the class-A mutant in run-mutations.sh asserts the
+# ten refusal row NAMES, so a swap makes the harness report
+# `missing = noroot-refusal-pacman noroot-refusal-pacman-dryrun` (WEAK) and fail the battery.
+# Neither direction is covered by the hostiles/positives names -- those halves are counted only
+# (recorded in the report as a known limit).
 #
 # 🚨 ROW PROTOCOL. Every failure is reported as `FAIL <row-name>: <message>`, the same convention as
 # the two sibling gates (test-detect.sh: `bad()`, G-INSTALL-2b; test-install.sh: `bad()`,
@@ -42,7 +53,7 @@
 #   noroot-hostile-prefix-tar            --prefix $HOME/x --method tar
 #   noroot-positive-help                 --help works unprivileged
 #   noroot-positive-detect-only          --detect-only works unprivileged
-#   noroot-rows                          the pinned-total assertion (10/2/2, fail-only)
+#   noroot-rows                          the pinned-total FLOOR assertion (>= 10/2/2, fail-only)
 #
 # 🚨 A SKIP exits 77, which is NOT a pass: the caller must treat it as a failure (rule 7 in
 # TASKS.md). The gate is meaningless without an unprivileged uid, so pretending otherwise would be
@@ -100,7 +111,7 @@ bad() { printf 'FAIL %s: %s\n' "$1" "$2"; fail=1; }
 # per case is emitted (see the header: the battery pins the row names, not the sub-assertions).
 problems=""
 cfail() { problems="$problems $1;"; }
-flush() { [ -z "$problems" ] || bad "$1" "[$2]$problems"; }  # flush ROW TAG
+flush() { [ -z "$problems" ] || bad "$1" "[$2] $problems"; }  # flush ROW TAG
 leftover_in_home() { find "$HOME_AFTER" -mindepth 1 -maxdepth 1 ! -name tmp -print 2>/dev/null; }
 
 # ---- (i) refusal: every --method, WITH and WITHOUT --dry-run, must refuse identically.
@@ -182,12 +193,18 @@ done
 #      guarded. What --help must SAY is asserted by G-INSTALL-2a instead (PLAN §19.1), which is a
 #      local gate and not part of this harness.
 
-# ---- the pin: the totals of the three halves, fail-only (C3).
+# ---- the pin: each half's total, as a FLOOR (C3).
 #      Three INDEPENDENT statements, not a `&&` chain: when someone empties a loop, ALL the counts
 #      that moved must be reported in the same run (a short-circuit would hide the second one).
-[ "$n_refuse"   -eq 10 ] || bad noroot-rows "refusal cases executed = $n_refuse, pinned = 10"
-[ "$n_hostile"  -eq  2 ] || bad noroot-rows "hostile-flag cases executed = $n_hostile, pinned = 2"
-[ "$n_positive" -eq  2 ] || bad noroot-rows "positive cases executed = $n_positive, pinned = 2"
+#      FLOOR, not equality: an ADDED case is not a defect and must not red the gate (the
+#      `mx_noroot_add_method` mutant in run-mutations.sh keeps this honest), while a LOST case is
+#      exactly the rot this row exists to catch. See the header for what the floor cannot see.
+#      ⚠ `-ge`, i.e. "fail when the count is BELOW the pin" -- `-ge PIN || bad` is the floor shape;
+#      `-lt PIN || bad` is its negation and reds a pristine gate (measured: it prints all three rows
+#      on a 10/2/2 run), which is the very defect this row was written to remove.
+[ "$n_refuse"   -ge 10 ] || bad noroot-rows "refusal cases executed = $n_refuse, pinned = at least 10"
+[ "$n_hostile"  -ge  2 ] || bad noroot-rows "hostile-flag cases executed = $n_hostile, pinned = at least 2"
+[ "$n_positive" -ge  2 ] || bad noroot-rows "positive cases executed = $n_positive, pinned = at least 2"
 
 rm -rf "$HOME_AFTER"
 if [ "$fail" = 0 ]; then
