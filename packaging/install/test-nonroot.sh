@@ -17,9 +17,37 @@
 #   (iii) positive -- --help and --detect-only must still work unprivileged, or the gate would
 #                     also pass for a script that always exits 1.
 #
+# 🚨 COUNTED AND PINNED (review salvedad C3). The three halves are COUNTED -- one increment per
+# case that actually ran -- and their totals are PINNED to 10/2/2 by the row `noroot-rows`, and the
+# summary line prints those counters, never literals. Before this, the OK line was a literal
+# string: a copy of this file with `pacman` (or the whole --dry-run loop) deleted printed the
+# identical "10 refusals" line and exited 0, so the numbers were an assertion rather than a
+# measurement. The pin is FAIL-ONLY: a case that is ADDED must not turn the gate red (an added case
+# is not a defect), a case that DISAPPEARED must. That is what makes `noroot-rows` a rot detector
+# instead of a nuisance.
+#
+# 🚨 ROW PROTOCOL. Every failure is reported as `FAIL <row-name>: <message>`, the same convention as
+# the two sibling gates (test-detect.sh: `bad()`, G-INSTALL-2b; test-install.sh: `bad()`,
+# G-INSTALL-3/4), because packaging/install/run-mutations.sh parses exactly that shape (`reds_of()`)
+# to assert that the row meant to catch a defect is among the rows that went red. WITHOUT it, a
+# G-INSTALL-7 failure is invisible to the battery: no red row, no verdict, no measurement.
+# ONE ROW PER CASE (the sub-assertions of a case are folded into its message), not one row per
+# sub-assertion: the battery pins the row NAMES, and a per-sub-assertion scheme would make the
+# expected red-row set depend on which sub-assertion happens to fire first -- i.e. on the machine's
+# arch and on the installer's step order. The stable row names are:
+#
+#   noroot-refusal-<method>              methods: auto apt dnf pacman tar (5, without --dry-run)
+#   noroot-refusal-<method>-dryrun       the same 5 with --dry-run
+#   noroot-hostile-prefix                --prefix $HOME/x
+#   noroot-hostile-prefix-tar            --prefix $HOME/x --method tar
+#   noroot-positive-help                 --help works unprivileged
+#   noroot-positive-detect-only          --detect-only works unprivileged
+#   noroot-rows                          the pinned-total assertion (10/2/2, fail-only)
+#
 # 🚨 A SKIP exits 77, which is NOT a pass: the caller must treat it as a failure (rule 7 in
 # TASKS.md). The gate is meaningless without an unprivileged uid, so pretending otherwise would be
-# a green-looking no-op -- the worst outcome for a gate.
+# a green-looking no-op -- the worst outcome for a gate. run-mutations.sh classifies `rc 77`/`^SKIP`
+# as SKIPPED, and a SKIPPED verdict is a battery FAIL.
 #
 # Hermetic: one private `mktemp -d`, nothing resolved from a shared path. The two emptiness
 # assertions are the reason -- a leftover file in a shared /tmp would turn into a false green (if it
@@ -62,6 +90,19 @@ reset_home() { rm -rf "$HOME_AFTER"; mkdir -p "$HOME_AFTER/tmp"; chown -R "$uid:
 reset_home
 fail=0
 
+# ---- the row protocol, and the counters the summary is derived from.
+#      n_* count CASES THAT RAN (one increment per loop iteration), never assertions: they are the
+#      evidence that a loop body was entered at all.
+n_refuse=0; n_hostile=0; n_positive=0
+bad() { printf 'FAIL %s: %s\n' "$1" "$2"; fail=1; }
+
+# cfail SUB_ASSERTION -- fold one failed sub-assertion into the CURRENT case's message, so ONE row
+# per case is emitted (see the header: the battery pins the row names, not the sub-assertions).
+problems=""
+cfail() { problems="$problems $1;"; }
+flush() { [ -z "$problems" ] || bad "$1" "[$2]$problems"; }  # flush ROW TAG
+leftover_in_home() { find "$HOME_AFTER" -mindepth 1 -maxdepth 1 ! -name tmp -print 2>/dev/null; }
+
 # ---- (i) refusal: every --method, WITH and WITHOUT --dry-run, must refuse identically.
 #      --dry-run is asserted too: a dry run that hides the root precondition would make this
 #      whole gate vacuous (EVIDENCE C25).
@@ -73,26 +114,27 @@ for m in auto apt dnf pacman tar; do
     out=$(as_uid "$HOME_AFTER" --method "$m" $extra 2>&1)
     rc=$?
     set -e
+    n_refuse=$((n_refuse + 1))
     tag="--method $m${extra:+ $extra}"
-    [ "$rc" -eq 1 ] || { echo "G-INSTALL-7[$tag]: exit=$rc, expected 1"; fail=1; }
+    if [ -n "$extra" ]; then row="noroot-refusal-$m-dryrun"; else row="noroot-refusal-$m"; fi
+    problems=""
+    [ "$rc" -eq 1 ] || cfail "exit=$rc, expected 1"
     # 🚨 the two message arms below changed shape with the 2026-10-16 ruling (the pointer's target
     #      and the non-support sentence): the old ones named a document the ruling deleted.
     printf '%s' "$out" | grep -q 'PACKAGING\.md' \
-      || { echo "G-INSTALL-7[$tag]: message does not point at docs/PACKAGING.md"; fail=1; }
+      || cfail "message does not point at docs/PACKAGING.md"
     printf '%s' "$out" | grep -q 'Nothing has been downloaded, unpacked or modified' \
-      || { echo "G-INSTALL-7[$tag]: message does not state that nothing was touched"; fail=1; }
+      || cfail "message does not state that nothing was touched"
     printf '%s' "$out" | grep -q 'Installing without root is not supported' \
-      || { echo "G-INSTALL-7[$tag]: message does not say that installing without root is unsupported"; fail=1; }
+      || cfail "message does not say that installing without root is unsupported"
     # $HOME must be EMPTY apart from the tmp dir we created: no ~/.local/share/darling-lol, no
     # partial ~/.darling, no downloaded asset.
-    leftover=$(find "$HOME_AFTER" -mindepth 1 -maxdepth 1 ! -name tmp -print 2>/dev/null)
-    if [ -n "$leftover" ]; then
-      echo "G-INSTALL-7[$tag]: the installer wrote into \$HOME as a non-root user:"
-      printf '%s\n' "$leftover" | sed 's/^/    /'; fail=1
-    fi
-    if [ -n "$(find "$HOME_AFTER/tmp" -mindepth 1 -print 2>/dev/null)" ]; then
-      echo "G-INSTALL-7[$tag]: the installer wrote into \$TMPDIR before refusing"; fail=1
-    fi
+    leftover=$(leftover_in_home)
+    [ -z "$leftover" ] \
+      || cfail "the installer wrote into \$HOME as a non-root user: $(printf '%s' "$leftover" | tr '\n' ' ')"
+    [ -z "$(find "$HOME_AFTER/tmp" -mindepth 1 -print 2>/dev/null)" ] \
+      || cfail "the installer wrote into \$TMPDIR before refusing"
+    flush "$row" "$tag"
   done
 done
 
@@ -107,20 +149,24 @@ done
 #      (step 2 -- before resolve_prefix and before any --dry-run branch), so 1 is the only correct
 #      status, and a mutant that gets out with 127 ("command not found") must be red here too instead
 #      of being caught by loop (i) alone. It is still the $HOME invariant that this loop exists for.
-for hf in "--prefix $HOME_AFTER/x" "--prefix $HOME_AFTER/x --method tar"; do
+hostile_case() {  # hostile_case ROW TAG ARGS...
+  local row=$1 tag=$2; shift 2
   reset_home
   set +e
-  # shellcheck disable=SC2086  # $hf is a deliberate word list of flags
-  out=$(as_uid "$HOME_AFTER" $hf 2>&1)
+  out=$(as_uid "$HOME_AFTER" "$@" 2>&1)
   rc=$?
   set -e
-  [ "$rc" -eq 1 ] || { echo "G-INSTALL-7[$hf]: exit=$rc, expected 1 (require_root) -- nothing may install into \$HOME as a non-root user"; fail=1; }
-  leftover=$(find "$HOME_AFTER" -mindepth 1 -maxdepth 1 ! -name tmp -print 2>/dev/null)
-  if [ -n "$leftover" ]; then
-    echo "G-INSTALL-7[$hf]: wrote into \$HOME as a non-root user:"
-    printf '%s\n' "$leftover" | sed 's/^/    /'; fail=1
-  fi
-done
+  n_hostile=$((n_hostile + 1))
+  problems=""
+  [ "$rc" -eq 1 ] \
+    || cfail "exit=$rc, expected 1 (require_root) -- nothing may install into \$HOME as a non-root user"
+  leftover=$(leftover_in_home)
+  [ -z "$leftover" ] \
+    || cfail "wrote into \$HOME as a non-root user: $(printf '%s' "$leftover" | tr '\n' ' ')"
+  flush "$row" "$tag"
+}
+hostile_case noroot-hostile-prefix     "--prefix $HOME_AFTER/x" --prefix "$HOME_AFTER/x"
+hostile_case noroot-hostile-prefix-tar "--prefix $HOME_AFTER/x --method tar" --prefix "$HOME_AFTER/x" --method tar
 
 # ---- (iii) positive: documentation and read-only detection stay usable unprivileged. Without
 #      this the gate would also pass for a script that simply always exits 1.
@@ -129,14 +175,24 @@ for a in --help --detect-only; do
   as_uid "$HOME_AFTER" "$a" >/dev/null 2>&1
   rc=$?
   set -e
-  [ "$rc" -eq 0 ] || { echo "G-INSTALL-7: '$a' must succeed unprivileged (rc=$rc)"; fail=1; }
+  n_positive=$((n_positive + 1))
+  [ "$rc" -eq 0 ] || bad "noroot-positive-${a#--}" "'$a' must succeed unprivileged (rc=$rc)"
 done
 # 🚨 rev 5: the "--help must not advertise <the deleted flag>" arm was removed with the flag it
 #      guarded. What --help must SAY is asserted by G-INSTALL-2a instead (PLAN §19.1), which is a
 #      local gate and not part of this harness.
 
+# ---- the pin: the totals of the three halves, fail-only (C3).
+#      Three INDEPENDENT statements, not a `&&` chain: when someone empties a loop, ALL the counts
+#      that moved must be reported in the same run (a short-circuit would hide the second one).
+[ "$n_refuse"   -eq 10 ] || bad noroot-rows "refusal cases executed = $n_refuse, pinned = 10"
+[ "$n_hostile"  -eq  2 ] || bad noroot-rows "hostile-flag cases executed = $n_hostile, pinned = 2"
+[ "$n_positive" -eq  2 ] || bad noroot-rows "positive cases executed = $n_positive, pinned = 2"
+
 rm -rf "$HOME_AFTER"
 if [ "$fail" = 0 ]; then
-  echo "G-INSTALL-7: OK (10 refusals + 2 hostile flags clean, --help/--detect-only work unprivileged)"
+  echo "G-INSTALL-7: OK ($n_refuse refusals + $n_hostile hostile flags clean, $n_positive unprivileged positives --help/--detect-only)"
+else
+  echo "G-INSTALL-7: FAILED"
 fi
 exit "$fail"

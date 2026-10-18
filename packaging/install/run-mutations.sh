@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# packaging/install/run-mutations.sh -- the SELF-TEST of the two §16 gates:
+# packaging/install/run-mutations.sh -- the SELF-TEST of the three §16 install gates:
 #
 #   packaging/install/test-detect.sh   G-INSTALL-2b  (distro detection over the 7 in-tree fixtures)
 #   packaging/install/test-install.sh  G-INSTALL-3/4 (the tarball install, its state file, the
 #                                                     documented removal, setuid, the prefix check)
+#   packaging/install/test-nonroot.sh  G-INSTALL-7  (the non-root negative control: 10 refusals +
+#                                                     2 hostile --prefix cases + 2 positives)
 #
 # Why it exists. A gate whose rows are never shown to fail is an assertion, not a measurement: the
 # T10 review's INFO-1 is exactly that failure mode (two mutants of the shipped installer passed every
@@ -15,9 +17,21 @@
 # A mutant that leaves a gate GREEN is a hole in that gate. The grid at the end prints, for every
 # mutant, exactly which rows went red.
 #
-#   ./packaging/install/run-mutations.sh                 # everything (needs docker for 3/4)
+# TWO MUTANT CLASSES (review salvedad C3):
+#   * class A mutates the ARTEFACT under test -- the shipped installer, or the documented recipe --
+#     and asks the question a gate exists to answer: "would this gate notice this defect at all?"
+#   * class B mutates the GATE ITSELF, which is what class A structurally cannot reach. G-INSTALL-7
+#     counts its own cases and PINS the totals (10/2/2, row `noroot-rows`); a pinned number that is
+#     never shown to move is one more unmeasured assertion, so the only way to demonstrate that the
+#     pin is load-bearing is to shrink the gate's case list and watch `noroot-rows` go red. Each
+#     class-B mutant drops exactly ONE case from ONE half, so each of the pin's statements (refusal
+#     with/without --dry-run, hostile, positive) is measured by its own mutant.
+#
+#   ./packaging/install/run-mutations.sh                 # everything (needs docker for 3/4 and 7)
 #   GATE_IMAGE=ubuntu:24.04 ./packaging/install/run-mutations.sh
 #   ./packaging/install/run-mutations.sh --detect-only   # G-INSTALL-2b only: no docker, no root
+#   ./packaging/install/run-mutations.sh --install-only  # G-INSTALL-3/4 only (docker, as root)
+#   ./packaging/install/run-mutations.sh --noroot-only   # G-INSTALL-7 only (docker, as root)
 #
 # 🚨 ARCH / IMAGE. G-INSTALL-2b is machine-independent and runs natively here (it is the unprivileged
 # half). G-INSTALL-3/4 installs a fixture tree and needs a throwaway container as root, and its
@@ -25,8 +39,11 @@
 # whole battery work on an arm64 box: `arch-refusal` is the only row that needs the REAL arch, and its
 # mutant replacement (mx_arch_accept) is exactly the mutation that makes it red. On x86_64 the gate
 # SKIPs that row and its mutant reports WEAK; that is the single expected difference.
+# G-INSTALL-7 also needs the container as ROOT (it creates an unprivileged uid and then drops into it
+# with setpriv itself), so the image must carry util-linux (`setpriv`) and passwd (`useradd`/
+# `groupadd`); ubuntu:24.04 has both, and needs no network.
 #
-# Requires for the install half: docker, and the image below (pull it first).
+# Requires for the install halves: docker, and the image below (pull it first).
 set -u
 
 REPO_ROOT=$(cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -34,21 +51,42 @@ cd "$REPO_ROOT"
 
 GATE_DETECT=packaging/install/test-detect.sh
 GATE_INSTALL=packaging/install/test-install.sh
+GATE_NOROOT=packaging/install/test-nonroot.sh
 INSTALLER=packaging/install/darling-lol-install.sh
 DOC=docs/PACKAGING.md
 FIXTURES=packaging/install/testdata/os-release
 GATE_IMAGE=${GATE_IMAGE:-arm64v8/ubuntu:24.04}
 ONLY=${1-}
 
-for f in "$GATE_DETECT" "$GATE_INSTALL" "$INSTALLER" "$DOC"; do
+# The 10 refusal rows the class-A mutant must turn red, spelled out: one per method x {plain,
+# --dry-run}. The assertion is on the SET, not on "some row", because these are the rows a
+# require_root bypass has to break (each case asserts the exit code, the docs pointer and the two
+# literal sentences, and the row is red when ANY of them stops holding).
+NOROOT_REFUSAL_ROWS="noroot-refusal-auto noroot-refusal-auto-dryrun \
+noroot-refusal-apt noroot-refusal-apt-dryrun \
+noroot-refusal-dnf noroot-refusal-dnf-dryrun \
+noroot-refusal-pacman noroot-refusal-pacman-dryrun \
+noroot-refusal-tar noroot-refusal-tar-dryrun"
+
+for f in "$GATE_DETECT" "$GATE_INSTALL" "$GATE_NOROOT" "$INSTALLER" "$DOC"; do
   [ -f "$f" ] || { echo "FATAL: $f is missing" >&2; exit 2; }
 done
 [ -d "$FIXTURES" ] || { echo "FATAL: $FIXTURES is missing (the 7 os-release fixtures are the input)" >&2; exit 2; }
 
 MUT=$(mktemp -d "${TMPDIR:-/tmp}/dlol-install-mutants.XXXXXX")
 trap 'rm -rf "$MUT"' EXIT INT TERM
+# 🚨 $MUT must be TRAVERSABLE by the unprivileged uid G-INSTALL-7 drops into (65431): mktemp -d
+# makes it 0700, which the container cannot traverse, and the gate then reports rc=126
+# ("Permission denied") for EVERY case. Measured: that reds all 14 rows -- including the two
+# positives, which cannot be red for the mutation's own reason -- so any class-A mutant would be
+# "CAUGHT" without the mutation doing anything. 0755 leaks nothing: this tree holds only copies of
+# files that are already in the repo.
+chmod 0755 "$MUT"
 cp "$INSTALLER" "$MUT/installer.base"
 cp "$DOC"       "$MUT/doc.base"
+# class B mutates the GATE, so it needs the gate's own pristine bytes: mutating the file in the
+# working tree would edit what we are measuring (and would leave the tree dirty).
+cp "$GATE_NOROOT" "$MUT/noroot.base"
 
 # --- the mutation primitive ----------------------------------------------------------------------
 # mut_line FILE SUBSTR [REPL]  -- line-oriented, so a mutation cannot silently reformat the rest of
@@ -89,11 +127,23 @@ gate_install() { # gate_install INSTALLER_PATH [DOC_PATH]  -- throwaway containe
   set -e
   return 0
 }
+gate_noroot() { # gate_noroot GATE_PATH [INSTALLER_PATH]  -- throwaway container, AS ROOT.
+                # G-INSTALL-7 creates the unprivileged uid and then drops into it itself with
+                # `setpriv`, so the container must be root; the gate's own SKIP/exit 77 is what
+                # protects a box where that is impossible.
+  local gate=$1 inst=${2-$INSTALLER}
+  set +e
+  OUT=$(docker run --rm -v "$REPO_ROOT":/repo -v "$MUT":/mut -w /repo --entrypoint bash \
+        "$GATE_IMAGE" "$gate" "$inst" 2>&1)
+  RC=$?
+  set -e
+  return 0
+}
 reds_of() { printf '%s' "$OUT" | awk '/^FAIL /{sub(/:$/,"",$2); printf "%s ", $2}'; }
 
 RESULTS=$MUT/results.txt
 : > "$RESULTS"
-PASS=0; FAILN=0
+PASS=0; FAILN=0; CONTROLS=0; MUTANTS=0
 
 # expect NAME EXPECTED_ROWS(space-separated; "" = none, i.e. the control)
 expect() {
@@ -116,7 +166,8 @@ expect() {
     verdict="CAUGHT(red=$reds)"
   fi
   case "$verdict" in
-    CONTROL-OK|CAUGHT*) PASS=$((PASS+1)) ;;
+    CONTROL-OK) PASS=$((PASS+1)); CONTROLS=$((CONTROLS+1)) ;;
+    CAUGHT*)    PASS=$((PASS+1)); MUTANTS=$((MUTANTS+1)) ;;
     *) FAILN=$((FAILN+1)) ;;
   esac
   printf '%-24s %-62s %s\n' "$name" "$verdict" "$(printf '%s' "$OUT" | tail -1)"
@@ -124,10 +175,10 @@ expect() {
 }
 
 echo "== §16 gate mutation battery -- image $GATE_IMAGE =="
-echo "installer=$(sha256sum "$INSTALLER" | cut -c1-12) doc=$(sha256sum "$DOC" | cut -c1-12)"
+echo "installer=$(sha256sum "$INSTALLER" | cut -c1-12) doc=$(sha256sum "$DOC" | cut -c1-12) noroot-gate=$(sha256sum "$GATE_NOROOT" | cut -c1-12)"
 echo
 
-if [ "$ONLY" != "--install-only" ]; then
+if [ "$ONLY" != "--install-only" ] && [ "$ONLY" != "--noroot-only" ]; then
   echo "-- G-INSTALL-2b ($GATE_DETECT, native) ---------------------------------------------------"
   # control: the unmutated installer must be GREEN (a battery whose control is red measures nothing)
   gate_detect "$INSTALLER"
@@ -156,7 +207,7 @@ if [ "$ONLY" != "--install-only" ]; then
   expect mx_fixture_dropped "fixtures-present steamos" "$INSTALLER" "$MUT/os-release-pruned"
 fi
 
-if [ "$ONLY" != "--detect-only" ]; then
+if [ "$ONLY" != "--detect-only" ] && [ "$ONLY" != "--noroot-only" ]; then
   echo "-- G-INSTALL-3/4 ($GATE_INSTALL, $GATE_IMAGE) -------------------------------------------"
   gate_install "$INSTALLER"
   expect control "" "$INSTALLER"
@@ -237,6 +288,44 @@ if [ "$ONLY" != "--detect-only" ]; then
     && { gate_install "$INSTALLER" /mut/doc_fallback_glob_wrong.sh; expect mx_doc_fallback_glob "remove-fallback" "$INSTALLER" /mut/doc_fallback_glob_wrong.sh; }
 fi
 
+if [ "$ONLY" != "--detect-only" ] && [ "$ONLY" != "--install-only" ]; then
+  echo "-- G-INSTALL-7 ($GATE_NOROOT, $GATE_IMAGE, as root) ---------------------------------------"
+  # control: the unmutated gate must be GREEN, and it must be green with the numbers it prints --
+  # the gate's own summary is derived from its counters, so a control here also asserts that the
+  # counts are still 10/2/2 (row `noroot-rows` would be the one to go red).
+  gate_noroot "$GATE_NOROOT"
+  expect control-noroot ""
+
+  # ---- class A: the ARTEFACT (the shipped installer). require_root is the precondition every
+  #      refusal row asserts; weakened, the 10 refusal rows must all go red. This is the mutation
+  #      that proves the gate can fail at all -- before C3, no mutant touched test-nonroot.sh, so
+  #      nothing in the tree had ever shown a G-INSTALL-7 row to be capable of failing.
+  cp "$MUT/installer.base" "$MUT/mx_root_never_refuses.sh"
+  mut_line "$MUT/mx_root_never_refuses.sh" \
+    'if [ "${EUID:-$(id -u)}" -eq 0 ]; then return 0; fi' 'if :; then return 0; fi' \
+    && { gate_noroot "$GATE_NOROOT" /mut/mx_root_never_refuses.sh; expect mx_root_never_refuses "$NOROOT_REFUSAL_ROWS" /mut/mx_root_never_refuses.sh; }
+
+  # ---- class B: the GATE's own case list, i.e. its counted-and-pinned totals. Each mutant drops
+  #      exactly ONE case from ONE half; the pin (`noroot-rows`) is the row that has to notice, so
+  #      each of the pin's four statements gets its own mutant. Without these, the pin would be one
+  #      more assertion nobody ever showed to move -- the exact defect C3 reported for the OK line.
+  cp "$MUT/noroot.base" "$MUT/mx_noroot_drop_method.sh"
+  mut_line "$MUT/mx_noroot_drop_method.sh" 'for m in auto apt dnf pacman tar; do' 'for m in auto apt dnf tar; do' \
+    && { gate_noroot /mut/mx_noroot_drop_method.sh; expect mx_noroot_drop_method "noroot-rows" /mut/mx_noroot_drop_method.sh; }
+
+  cp "$MUT/noroot.base" "$MUT/mx_noroot_drop_dryrun.sh"
+  mut_line "$MUT/mx_noroot_drop_dryrun.sh" 'for extra in "" "--dry-run"; do' 'for extra in ""; do' \
+    && { gate_noroot /mut/mx_noroot_drop_dryrun.sh; expect mx_noroot_drop_dryrun "noroot-rows" /mut/mx_noroot_drop_dryrun.sh; }
+
+  cp "$MUT/noroot.base" "$MUT/mx_noroot_drop_hostile.sh"
+  mut_line "$MUT/mx_noroot_drop_hostile.sh" 'hostile_case noroot-hostile-prefix-tar' \
+    && { gate_noroot /mut/mx_noroot_drop_hostile.sh; expect mx_noroot_drop_hostile "noroot-rows" /mut/mx_noroot_drop_hostile.sh; }
+
+  cp "$MUT/noroot.base" "$MUT/mx_noroot_drop_positive.sh"
+  mut_line "$MUT/mx_noroot_drop_positive.sh" 'for a in --help --detect-only; do' 'for a in --help; do' \
+    && { gate_noroot /mut/mx_noroot_drop_positive.sh; expect mx_noroot_drop_positive "noroot-rows" /mut/mx_noroot_drop_positive.sh; }
+fi
+
 # --- grid -----------------------------------------------------------------------------------------
 echo
 echo "== grid: mutant -> rows that went red =="
@@ -246,4 +335,6 @@ done
 echo
 echo "PASS=$PASS FAIL=$FAILN  (a FAIL means either the gate is blind to that defect, or a row is not measured)"
 [ "$FAILN" -eq 0 ] || exit 1
-echo "§16 gates: every row of both gates is measured"
+echo "§16 gates (2b + 3/4 + 7): $CONTROLS controls green, $MUTANTS mutants caught, $FAILN not measured"
+echo "  -- class A = the artefact (the shipped installer, or the documented recipe)"
+echo "  -- class B = G-INSTALL-7's own case list (each mutant proves one pinned total is load-bearing)"
