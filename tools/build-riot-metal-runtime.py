@@ -13,6 +13,7 @@ for line in (folder / 'CMakeFiles/Metal.dir/flags.make').read_text().splitlines(
         flags[key] = shlex.split(value)
 resource_include = subprocess.check_output(['clang++', '-print-resource-dir'], text=True).strip() + '/include'
 flags['CXX_INCLUDES'] = [resource_include if value.startswith('/usr/lib/clang/') and value.endswith('/include') else value for value in flags['CXX_INCLUDES']]
+# MTLDevice.mm reads Vulkan device properties through Indium's private headers.
 flags['CXX_INCLUDES'].append('-I' + str(root / 'build/darling-src/src/external/metal/deps/indium/private-include'))
 link = shlex.split((folder / 'CMakeFiles/Metal.dir/link.txt').read_text())
 # These objects passed live League validation. Keep the broader resource/queue

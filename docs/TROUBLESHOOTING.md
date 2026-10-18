@@ -123,6 +123,18 @@ RCLOL_CDN_IPV4_ONLY=0 ./scripts/run.sh
 The resolver change requires a rebuilt/installed base runtime. The environment
 flag alone cannot alter an older Libinfo binary.
 
+## `Unable to read system root certificates` or `Error -25263`
+
+Riot logs `CertBundle: Unable to read system root certificates` and Chromium logs `[known_roots_mac.cc(60)] Unable to determine trusted roots; assuming all roots are trusted! Error -25263` when the prefix has no system trust domain. Security reads that domain from `/System/Library/Keychains/SystemRootCertificates.keychain` and `SystemTrustSettings.plist`, which Darling does not ship, so `SecTrustSettingsCopyCertificates` returns `errSecNoTrustSettings`.
+
+`tools/ensure-darling-root-certificates.py` builds both from the host CA bundle (`/etc/ssl/cert.pem` or whichever bundle Python's `ssl` reports; `--bundle` overrides it). The launcher and `scripts/install-runtime.sh` run it. Each self-signed root gets an unrestricted trust entry. The keychain is built with the guest `security` tool in a single `darling shell`. A stamp in the same directory records the bundle's digest, so later launches skip it without starting Darling until the host bundle changes. If Darling was already running and the guest could not write the directory, the script installs the files on the host and says they apply after `darling shutdown`. A failure prints `Darling system root certificates were not installed: …` and the launch continues. To rebuild by hand:
+
+```sh
+python3 build/runtime/tools/ensure-darling-root-certificates.py --force
+```
+
+`python3 -m unittest tests.test_root_certificates` compares the generated SHA-1 keys, issuer names and serial numbers with OpenSSL, and checks that an unchanged bundle is skipped. It uses stub `darling` and `security` commands. Reading the keychain and the system trust domain inside a real guest (`security find-certificate -a /System/Library/Keychains/SystemRootCertificates.keychain`, `security dump-trust-settings -s`) is not yet confirmed.
+
 ## Riot closes after a network lookup is cancelled
 
 Two local crashes were traced to `CFNetwork::_HostCancel` calling `CFRetain(NULL)`.
@@ -311,6 +323,19 @@ Exercised on a single-GPU RTX 3060 desktop (driver 615.71, sway with Xwayland), 
 - **Aborts during a match.** NVIDIA's driver opens a `/dev/nvidia0` descriptor per Vulkan memory allocation, about 6,800 in a match, while Darling processes inherited the launching shell's limit (2048 here) and mldr keeps each thread's darlingserver socket just below it. The launcher now raises the soft limit to 65536, `setrlimit` no longer lowers `RLIMIT_NOFILE` (the game asks for 10240, which lowered a higher Linux limit and broke every later socket), and mldr logs socket and checkin failures as `LOLRPCSOCKET`/`LOLCHECKIN` in `/tmp/lolsig.log` and retries them.
 - **Signals on driver threads.** NVIDIA's driver threads do not block signals, so a process-directed signal (tmux sends `SIGWINCH` on every resize) could land on a thread without a darlingserver socket and abort the process. Such an asynchronous signal is now forwarded to the main thread.
 - **Frame rate.** NVIDIA's blocking `vkWaitSemaphores` wakes the waiter 1-2 ms after the GPU signals (an empty submit completes in about 15 us when polled). Indium now polls completion for up to 2 ms before blocking (guest file `/tmp/metal-wait-spin-us` sets the budget in microseconds, 0 disables it). A custom match went from about 20 to 27 FPS. The GPU still idles at low clocks, and an NVIDIA driver thread spends about 70% of a core in ioctls; locking the GPU clock did not help, and the cause is not identified yet.
+- **Client GPU name.** The launcher exports `DARLING_METAL_GPU_NAME` so the client sees a Mac-plausible GPU; `DARLING_METAL_GPU_NAME=` (empty) or a bare `darling` reports the host GPU.
+
+### What Metal reports about the GPU
+
+`MTLDevice.name` is the selected Vulkan device's name in macOS style: the trailing driver note in brackets and the `(R)`/`(TM)` marks are removed (`AMD Radeon RX 6800 XT (RADV NAVI21)` becomes `AMD Radeon RX 6800 XT`, `Intel(R) UHD Graphics 630 (CML GT2)` becomes `Intel UHD Graphics 630`, `llvmpipe (LLVM …)` becomes `llvmpipe`). NVIDIA names are unchanged. The name is never replaced with another vendor's GPU. Before 2026-10-17 it was always `Darling Indium Device`.
+
+`recommendedMaxWorkingSetSize` is the size of the device-local Vulkan heaps (the VRAM) on a discrete GPU. On integrated and software GPUs it is the size of all heaps, because their device-local heap can be just the firmware carve-out while they also use system RAM; macOS likewise reports a large share of system RAM for unified-memory GPUs. It falls back to the old 1 GiB when Vulkan reports no usable heap. `hasUnifiedMemory` stays `YES` by default: with `NO`, apps switch to managed and private resource paths (`synchronizeResource:`, private buffers created with data) that are not implemented here. Set these in the game's environment to override:
+
+- `DARLING_METAL_GPU_NAME=<name>`: report this name.
+- `DARLING_METAL_VRAM_MB=<positive integer>`: report this working-set size in MiB. Other values are ignored.
+- `DARLING_METAL_HOST_UNIFIED_MEMORY=1`: report `hasUnifiedMemory` from the GPU type (`YES` for integrated and software GPUs, `NO` for discrete ones). This is experimental; on a discrete GPU it can break rendering.
+
+Each process reads these once.
 
 ### Host-side checks
 
