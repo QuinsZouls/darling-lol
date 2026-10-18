@@ -35,10 +35,25 @@
 #                             the image must never be the thing that silently decides otherwise.
 #   T4_GATES_BREAK=<name>     negative-control hook: break the OBJECT under test and re-run (see
 #                             the bottom of this file). Unset in a normal run.
-#   T4_GATES_CONTROLS=<spec>  `all` (default) or a space-separated subset of the control names.
-#   T4_GATES_NO_CONTROLS=1    skip the control sweep. The gate rows are unchanged; the sweep is the
-#                             proof they can go red, so it is ON by default.
-#   T4_GATES_QUIET=1          print only the rows that are not PASS (what the sweep reads).
+#   T4_GATES_CONTROLS=<spec>  `all` (default) or a space-separated subset of the control names. The
+#                             resolved list is what the sweep runs AND what the skip account counts,
+#                             and a spec that selects no control is a FAILED row -- an empty sweep is
+#                             not a green sweep.
+#   T4_GATES_NO_CONTROLS=1    do not run the control sweep. The gate rows are unchanged; the sweep
+#                             is the proof they can go red, so it is ON by default. A sweep that
+#                             does not run is REPORTED and counted as skipped (`N skipped` in the
+#                             summary plus one named SKIP per control), never folded into `passed`
+#                             and never fatal: nothing in CI runs this battery (grep -rn testdata
+#                             .github/ -> no match), so no input is *expected* here and there is no
+#                             equivalent of run-deb-gates.sh's T3_GATES_REQUIRE_DOCKER to mirror.
+#   T4_GATES_QUIET=1          print only the rows that are not PASS (what the sweep reads). A SKIP
+#                             is not a PASS, so the skip and UNMEASURED lines and every summary
+#                             count still print.
+#   T4_GATES_ALLOW_UNMEASURED=1
+#                             accept a gate row that could not be measured. By DEFAULT an UNMEASURED
+#                             row is FATAL (rc 1): an image without python3 cannot measure G-RPM-4's
+#                             filter analysis, and "the tool is missing" must not read as "green".
+#                             Set this to accept that gap on purpose (a T4_RPM_IMAGE with no python3).
 #   T4_GATES_KEEP=1           keep and print the private work directory, for a red row that needs
 #                             its artifacts inspected.
 #
@@ -154,12 +169,25 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else
   C_OK=; C_ER=; C_SK=; C_B=; C_0=
 fi
-rows=0; pass=0; fail=0; skips=0
+# Every row ends in exactly one of four states. PASS, FAIL, or -- when its precondition is not met --
+# SKIP, which is COUNTED and NAMED (run-deb-gates.sh is the model for `skips`) and never folded into
+# `pass`; UNMEASURED is the fourth, for a row whose own work did not run and which therefore must not
+# be counted as a PASS (the no-python3 branch of G-RPM-4 below). `rows` is the number of rows that
+# produced a verdict, so `rows == pass + fail`, asserted at the summary -- `chk` used to leave `rows`
+# alone, and the summary read "29 rows, 37 passed": a counter without a definition.
+rows=0; pass=0; fail=0; skips=0; unmeas=0
 ROWFAIL=0
+# control-row counters (the NEGATIVE CONTROLS section, below the summary): ctl_no prints a FAIL and
+# counts a control that did not kill its row, without touching `pass`/`fail` -- the gate rows'
+# verdict is printed by the summary, and a control failure must not rewrite a reported number.
+ctl_ok=0; ctl_bad=0; ctl_rows=0
 ok()   { pass=$((pass+1)); [ -n "$QUIET" ] || printf '  %sPASS%s %s\n' "$C_OK" "$C_0" "$1"; }
 no()   { fail=$((fail+1)); printf '  %sFAIL%s %s\n' "$C_ER" "$C_0" "$1"; }
+ctl_no() { ctl_bad=$((ctl_bad+1)); printf '  %sFAIL%s %s\n' "$C_ER" "$C_0" "$1"; }
 sk()   { skips=$((skips+1)); printf '  %sSKIP%s %s\n' "$C_SK" "$C_0" "$1"; }
-chk() { # chk LABEL GOT WANT
+unmeasured() { unmeas=$((unmeas+1)); printf '  %sUNMEASURED%s %s\n' "$C_SK" "$C_0" "$1"; }
+chk() { # chk LABEL GOT WANT -- a one-assertion row
+  rows=$((rows+1))
   if [ -z "$2" ]; then no "$1: EMPTY result (command failed)"
   elif [ "$2" = "$3" ]; then ok "$1 ($2)"
   else no "$1: got '$2', want '$3'"; fi
@@ -678,6 +706,11 @@ echo "container: done -- rpmbuild rc $(cat "$OUT/build.rc"), $(wc -l < "$OUT/rpm
 IN_CONTAINER
 
 [ -n "$QUIET" ] || printf '  running %s %s (one measurement run: build, queries, rpmlint, install)\n' "$DOCKER" "$IMAGE"
+# This row's verdict is printed by `ok`/`no` directly (not through `chk`/`end_row`), so it has to count
+# its own row here: the invariant the summary asserts is `rows == pass + fail`, and a row verdict that
+# does not count `rows` is the very defect this file fixes. Measured -- before this line the fixed file
+# read `FAIL the row counter is torn: rows=36 != pass+fail=37` on a plain run (after/rpm-default.txt).
+rows=$((rows+1))
 if ! "$DOCKER" run --rm -v "$WORK:/work" -v "$SRC:/src" \
      -e "T4_GATES_BREAK=$BREAK" -e "T4_HOST_UID=$(id -u)" -e "T4_HOST_GID=$(id -g)" \
      -e "FIXTURE_TAG=$FIXTURE_TAG" \
@@ -1015,7 +1048,14 @@ end_row "G-RPM-3 the launcher carries no maintainer script"
 sec "G-RPM-4  rpmlint in fedora:41 (errors fail, warnings do not)"
 
 if [ "$(rc rpmlint-cfg)" = 127 ]; then
-  sk "rpmlint is not in this image: G-RPM-4 unverified ($IMAGE)"
+  # rpmlint is absent from this image: the three G-RPM-4 rows below did not run, and a single `sk`
+  # line for three rows is the same lie in a smaller place (`skips` would count 1, the summary would
+  # be green, and two rows would have no trace at all). Each row gets its own named UNMEASURED line,
+  # so the summary's own `N row(s) UNMEASURED` is an account of exactly what is missing -- and an
+  # unmeasured row is fatal unless the gap is accepted with T4_GATES_ALLOW_UNMEASURED=1.
+  unmeasured "G-RPM-4 rpmlint -c: rc=0, 0 errors (NOT measured: rpmlint is not in $IMAGE)"
+  unmeasured "G-RPM-4 the config is the difference between errors-on and 0 errors (NOT measured: rpmlint is not in $IMAGE)"
+  unmeasured "G-RPM-4 every filter is load-bearing (NOT measured: rpmlint is not in $IMAGE)"
 else
   sa "rpmlint -c exits 0" "$(rc rpmlint-cfg)" "0"
   sa "with 0 errors (warnings are tolerated by policy, PLAN 9.6's rule; their count is not invariant)" \
@@ -1046,9 +1086,12 @@ else
     sa "the no-config run does report errors for the config to explain" "$(num filters.txt '^errors=[1-9][0-9]*$')" "1"
     end_row "G-RPM-4 every filter is load-bearing (7 filters explain every no-config error, none dead)"
   else
-    sk "the image had no python3: the per-filter analysis did not run"
-    sa "rpmlint.toml lists its filters" "$(num rpmlint-config.toml '^Filters = \[')" "1"
-    end_row "G-RPM-4 rpmlint.toml lists filters (dead-filter check skipped: no python3 in the image)"
+    sk "the image had no python3: the per-filter analysis did not run ($IMAGE)"
+    # The row below used to be an `end_row` whose own label said "skipped" while its verdict landed
+    # in `passed`: a row that was never measured, counted as a measured one. It is reported as
+    # UNMEASURED -- its own line, outside `passed`, outside `rows` -- because that is the whole point
+    # of the class: a green total may never cover work that did not happen.
+    unmeasured "G-RPM-4 every filter is load-bearing (NOT measured: the analysis needs python3 in $IMAGE)"
   fi
 fi
 
@@ -1090,46 +1133,99 @@ sa "while a DEFINED macro (%{_bindir}) in the same scriptlet IS expanded (escapi
 end_row "G-RPM-5 the %a mutation of TASKS.md T4 is inert on this toolchain"
 
 # ================================================================================================
+# A disabled sweep is decided BEFORE the summary: its rows are rows of this battery and have to reach
+# the summary's `skipped` field. A bare `note` (what this used to be) let the whole NEGATIVE CONTROLS
+# section vanish from every total -- measured: `T4_GATES_NO_CONTROLS=1 T4_GATES_QUIET=1` printed
+# `29 rows, 37 passed, 0 failed` with `grep -ci 'control\|skip'` = 0 over the transcript.
+#
+# The sweep's row list is resolved ONCE (T4_GATES_CONTROLS=all|subset) so that the sweep and its skip
+# accounting iterate the same list: `K skipped` is then the same K as the controls that would have run.
+sweep_rows=
+for name in $CONTROL_NAMES; do
+  case " ${T4_GATES_CONTROLS:-all} " in
+    " all " | *" $name "*) sweep_rows="$sweep_rows $name" ;;
+  esac
+done
+# An empty resolved list is not "no controls to run": it is an unaccountable sweep -- a typo in
+# T4_GATES_CONTROLS, or a CONTROL_NAMES that lost its rows -- and the summary would then read
+# "0 control(s) killed their row, 0 did not": green, with the whole proof absent. Refuse up front,
+# like the T4_GATES_BREAK name check (stderr + rc 2), because a battery that cannot say what it swept
+# has nothing to report.
+if [ -z "$sweep_rows" ]; then
+  printf 'run-rpm-gates: the control list is empty: T4_GATES_CONTROLS=%s selected no control (--list-controls)\n' \
+    "${T4_GATES_CONTROLS:-all}" >&2
+  exit 2
+fi
+sweep_skipped=0
+if [ -n "$CONTROLS" ]; then
+  sweep_skipped=1
+  sweep_n=0
+  skips0=$skips
+  for name in $sweep_rows; do
+    sweep_n=$((sweep_n + 1))
+    sk "NEGATIVE CONTROLS $name (the sweep is off: T4_GATES_NO_CONTROLS / T4_GATES_BREAK)"
+  done
+  # The `skipped` field has to be the sweep's REAL row count, so it is asserted: a constant in place
+  # of the counter is the same lie in a new place. Asserted as a DELTA, because other skip sites in
+  # this file (rpmlint absent, python3 absent) legitimately contribute to `skips` too.
+  [ "$((skips - skips0))" = "$sweep_n" ] \
+    || no "the skip counter is torn: $((skips - skips0)) SKIPped for $sweep_n control row(s)"
+fi
+
 sec "SUMMARY"
-printf '  %d rows, %d passed, %d failed' "$rows" "$pass" "$fail"
-if [ "$skips" = 0 ]; then printf '\n'; else printf ', %d skipped\n' "$skips"; fi
+# `rows` is one unambiguous thing (a row that produced a verdict): assert it here, so the summary can
+# never read "fewer rows than passed" (29 rows, 37 passed -- what `chk` not counting `rows` produced).
+[ "$rows" = "$((pass + fail))" ] \
+  || no "the row counter is torn: rows=$rows != pass+fail=$((pass + fail))"
+printf '  %d rows: %d passed, %d failed, %d skipped\n' "$rows" "$pass" "$fail" "$skips"
+[ "$skips" = 0 ] \
+  || printf '  %s%d row(s) SKIPped: SKIP is not PASS%s\n' "$C_SK" "$skips" "$C_0"
+[ "$unmeas" = 0 ] \
+  || printf '  %s%d row(s) UNMEASURED: an unmeasured row is not a PASS%s\n' "$C_SK" "$unmeas" "$C_0"
 if [ "$fail" != 0 ]; then
   printf '\n%sFAILED%s -- %d row(s) red. A red row here is a red gate: fix the object, not the row.\n' "$C_ER" "$C_0" "$fail" >&2
   exit 1
 fi
+# A row that never ran is not a PASS -- and it is not a silent exit 0 either: a battery that cannot
+# MEASURE a gate row must not call the run green (the no-python3 image is that case, not a knob).
+# An image that legitimately cannot carry the analysis says so out loud: T4_GATES_ALLOW_UNMEASURED=1.
+if [ "$unmeas" != 0 ] && [ -z "${T4_GATES_ALLOW_UNMEASURED:-}" ]; then
+  printf '\n%sFAILED%s -- %d gate row(s) were never measured (%s): install the tool, or set T4_GATES_ALLOW_UNMEASURED=1 to accept the gap on purpose.\n' \
+    "$C_ER" "$C_0" "$unmeas" "$IMAGE" >&2
+  exit 1
+fi
+[ "$sweep_skipped" = 0 ] || exit 0
 
 # ================================================================================================
 # NEGATIVE CONTROLS. Each one breaks the OBJECT under test in the private copy, re-runs this whole
 # battery, and asserts that the row it names goes RED -- and that the break itself was not a no-op
 # (a mutation that changes nothing proves nothing). A control run never sweeps (recursion guard).
-if [ -n "$CONTROLS" ]; then
-  [ -n "$QUIET" ] || printf '\n%snote%s control sweep skipped (T4_GATES_NO_CONTROLS / T4_GATES_BREAK)\n' "$C_SK" "$C_0"
-  exit 0
-fi
-
-sec "NEGATIVE CONTROLS  (T4_GATES_BREAK=<name>, T4_GATES_CONTROLS='$CONTROL_NAMES')"
-WANT=${T4_GATES_CONTROLS:-all}
-ctl_ok=0
-ctl_bad=0
-for name in $CONTROL_NAMES; do
-  case " $WANT " in
-    " all " | *" $name "*) : ;;
-    *) continue ;;
-  esac
+sec "NEGATIVE CONTROLS  (T4_GATES_BREAK=<name>, T4_GATES_CONTROLS='$sweep_rows')"
+for name in $sweep_rows; do
+  ctl_rows=$((ctl_rows + 1))
   row=$(ctl_row "$name")
   log=$WORK/ctl-$name.log
   T4_GATES_BREAK=$name T4_GATES_NO_CONTROLS=1 T4_GATES_QUIET=1 bash "$0" > "$log" 2>&1
   child_rc=$?
   if grep -q 'BREAK-NOOP\|BREAK-UNKNOWN' "$log"; then
-    ctl_bad=$((ctl_bad+1)); no "control $name: the mutation itself is broken (see the log above)"
+    ctl_no "control $name: the mutation itself is broken (see the log above)"
   elif [ "$child_rc" = 0 ]; then
-    ctl_bad=$((ctl_bad+1)); no "control $name: the battery still passed with the object broken"
+    ctl_no "control $name: the battery still passed with the object broken"
   elif ! grep -qF "FAIL $row" "$log"; then
-    ctl_bad=$((ctl_bad+1)); no "control $name: '$row' did not go red"
+    ctl_no "control $name: '$row' did not go red"
   else
-    ctl_ok=$((ctl_ok+1)); ok "control $name: '$row' went red"
+    ctl_ok=$((ctl_ok+1))
+    [ -n "$QUIET" ] || printf '  %sPASS%s control %-16s -> %s went red\n' "$C_OK" "$C_0" "$name" "$row"
   fi
 done
+# The sweep's own total is asserted the same way as the gate rows': k controls were selected, so
+# ctl_ok + ctl_bad must be k. A control row that vanishes is exactly the defect this file fixes.
+if [ "$((ctl_ok + ctl_bad))" != "$ctl_rows" ]; then
+  printf '  %sFAIL%s the sweep counter is torn: %d of %d control(s) reported\n' \
+    "$C_ER" "$C_0" "$((ctl_ok + ctl_bad))" "$ctl_rows"
+  printf '\n%sFAILED%s -- the control sweep cannot account for its own rows.\n' "$C_ER" "$C_0" >&2
+  exit 1
+fi
 printf '  %d control(s) killed their row, %d did not\n' "$ctl_ok" "$ctl_bad"
 if [ "$ctl_bad" != 0 ]; then
   printf '\n%sFAILED%s -- %d control(s) did not kill their row: a gate without a control is a ghost row.\n' "$C_ER" "$C_0" "$ctl_bad" >&2
