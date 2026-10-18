@@ -35,10 +35,14 @@
 #                             the image must never be the thing that silently decides otherwise.
 #   T4_GATES_BREAK=<name>     negative-control hook: break the OBJECT under test and re-run (see
 #                             the bottom of this file). Unset in a normal run.
-#   T4_GATES_CONTROLS=<spec>  `all` (default) or a space-separated subset of the control names. The
+#   T4_GATES_CONTROLS=<spec>  `all` (default) or a space-separated subset of the control names.
+#                             Matching is TOKEN-EXACT (`all` is the literal word; otherwise a control
+#                             is selected only when its whole name appears as one word of the spec),
+#                             so an element that spells no control is IGNORED, not reported. The
 #                             resolved list is what the sweep runs AND what the skip account counts,
-#                             and a spec that selects no control is a FAILED row -- an empty sweep is
-#                             not a green sweep.
+#                             and it is printed in the sweep's own header: read THAT, not the spec.
+#                             A spec that selects no control at all is REFUSED before any summary
+#                             (stderr + rc 2) -- an empty sweep is not a green sweep.
 #   T4_GATES_NO_CONTROLS=1    do not run the control sweep. The gate rows are unchanged; the sweep
 #                             is the proof they can go red, so it is ON by default. A sweep that
 #                             does not run is REPORTED and counted as skipped (`N skipped` in the
@@ -49,6 +53,14 @@
 #   T4_GATES_QUIET=1          print only the rows that are not PASS (what the sweep reads). A SKIP
 #                             is not a PASS, so the skip and UNMEASURED lines and every summary
 #                             count still print.
+#   T4_GATES_EXPECT_ROWS=<n>  the number of VERDICT rows this run must produce (default 37: PLAN
+#                             10's T4 gate table). `rows` is asserted `== pass + fail` (the totals are
+#                             consistent) and `== this` (the run is COMPLETE): deleting one `end_row`
+#                             lowers `rows` and `pass` together, so consistency alone cannot see a row
+#                             that left the transcript -- the pin can. A degraded environment must
+#                             still account for every row (as a verdict, a SKIP or an UNMEASURED
+#                             line), which is why this number does not move across the images this
+#                             battery supports.
 #   T4_GATES_ALLOW_UNMEASURED=1
 #                             accept a gate row that could not be measured. By DEFAULT an UNMEASURED
 #                             row is FATAL (rc 1): an image without python3 cannot measure G-RPM-4's
@@ -1086,6 +1098,18 @@ else
     sa "the no-config run does report errors for the config to explain" "$(num filters.txt '^errors=[1-9][0-9]*$')" "1"
     end_row "G-RPM-4 every filter is load-bearing (7 filters explain every no-config error, none dead)"
   else
+    # The row below is measurable WITHOUT python3: it is a host-side grep on the config copied out of
+    # the packaging tree (`cp $SRC/packaging/rpm/rpmlint.toml $OUT/rpmlint-config.toml` above), so the
+    # environment's degradation does not take it away. It used to be an `end_row` whose own LABEL said
+    # "skipped" while its verdict landed in `passed` -- a PASS on a row that did not run, shape A1.
+    # The label was the lie, so the row STAYS and the label is what changed: deleting the row instead
+    # left the no-python3 transcript with one row FEWER than the supported image and no trace of it
+    # anywhere -- the class, one level down, inside the fix of the class. The invariant this restores:
+    # when the environment degrades, NO row may silently leave the transcript; every row of the normal
+    # run is still accounted for as a verdict, a SKIP or an UNMEASURED line (and `rows`, pinned to
+    # T4_GATES_EXPECT_ROWS, stays the same as the supported image's 37).
+    sa "rpmlint.toml lists its filters" "$(num rpmlint-config.toml '^Filters = \[')" "1"
+    end_row "G-RPM-4 rpmlint.toml lists filters"
     sk "the image had no python3: the per-filter analysis did not run ($IMAGE)"
     # The row below used to be an `end_row` whose own label said "skipped" while its verdict landed
     # in `passed`: a row that was never measured, counted as a measured one. It is reported as
@@ -1148,9 +1172,12 @@ for name in $CONTROL_NAMES; do
 done
 # An empty resolved list is not "no controls to run": it is an unaccountable sweep -- a typo in
 # T4_GATES_CONTROLS, or a CONTROL_NAMES that lost its rows -- and the summary would then read
-# "0 control(s) killed their row, 0 did not": green, with the whole proof absent. Refuse up front,
-# like the T4_GATES_BREAK name check (stderr + rc 2), because a battery that cannot say what it swept
-# has nothing to report.
+# "0 control(s) killed their row, 0 did not": green, with the whole proof absent. Refused (stderr +
+# rc 2) before ANY summary is printed, the way the T4_GATES_BREAK name check refuses an unknown
+# control -- but note WHERE this sits: the name check is near the top of this file, BEFORE the
+# measurement phase, while this one is AFTER it (the gate rows above are rows of the same run), so a
+# spec of pure typos has already paid for its container run when it is refused. The resolved list is
+# printed in the sweep's own header: that, and not the spec, is what an operator must read.
 if [ -z "$sweep_rows" ]; then
   printf 'run-rpm-gates: the control list is empty: T4_GATES_CONTROLS=%s selected no control (--list-controls)\n' \
     "${T4_GATES_CONTROLS:-all}" >&2
@@ -1166,8 +1193,9 @@ if [ -n "$CONTROLS" ]; then
     sk "NEGATIVE CONTROLS $name (the sweep is off: T4_GATES_NO_CONTROLS / T4_GATES_BREAK)"
   done
   # The `skipped` field has to be the sweep's REAL row count, so it is asserted: a constant in place
-  # of the counter is the same lie in a new place. Asserted as a DELTA, because other skip sites in
-  # this file (rpmlint absent, python3 absent) legitimately contribute to `skips` too.
+  # of the counter is the same lie in a new place. Asserted as a DELTA, because the run's other skip
+  # site (the python3-absent row) legitimately contributes to `skips` too -- the rpmlint-absent
+  # branch does NOT: its three rows are `unmeasured`, a counter of their own.
   [ "$((skips - skips0))" = "$sweep_n" ] \
     || no "the skip counter is torn: $((skips - skips0)) SKIPped for $sweep_n control row(s)"
 fi
@@ -1177,6 +1205,14 @@ sec "SUMMARY"
 # never read "fewer rows than passed" (29 rows, 37 passed -- what `chk` not counting `rows` produced).
 [ "$rows" = "$((pass + fail))" ] \
   || no "the row counter is torn: rows=$rows != pass+fail=$((pass + fail))"
+# ... and assert that the run is COMPLETE, not only self-consistent. Deleting one whole row (an
+# `end_row` moved under an `if`) lowers `rows` and `pass` together: the line above stays satisfied and
+# the summary stays green over a transcript that lost a row. The expected number is a property of this
+# battery's contract with PLAN 10's T4 table, so it is pinned -- and it is the SAME number on every
+# image that gets here (the python3-absent row is a verdict row of its own, and an unmeasured row is
+# reported outside `rows`).
+[ "$rows" = "${T4_GATES_EXPECT_ROWS:-37}" ] \
+  || no "the run did not account for every gate row: rows=$rows, expected ${T4_GATES_EXPECT_ROWS:-37} (T4_GATES_EXPECT_ROWS)"
 printf '  %d rows: %d passed, %d failed, %d skipped\n' "$rows" "$pass" "$fail" "$skips"
 [ "$skips" = 0 ] \
   || printf '  %s%d row(s) SKIPped: SKIP is not PASS%s\n' "$C_SK" "$skips" "$C_0"

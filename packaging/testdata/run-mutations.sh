@@ -302,8 +302,12 @@ fi
 sec "SUMMARY"
 # The bucket sizes are pinned BEFORE the totals are printed, so a FATAL is part of the number the
 # reader sees: a total printed before the checks that can change it is the same lie in a new place.
-[ "$pp" = 8 ] || { printf '  FATAL the G-PREFIX-1 table must have 8 rows, has %d\n' "$pp"; fail=$((fail+1)); }
-[ "$sp" = 5 ] || { printf '  FATAL the G-STATIC-6 table must have 5 rows, has %d\n' "$sp"; fail=$((fail+1)); }
+# Each pin counts the bucket's ROWS (passed + failed), not its passed rows: under T1_MUTATION_FLIP=M1
+# one row of the G-PREFIX-1 table is RED, so a pin on `$pp` alone read "must have 8 rows, has 7" --
+# a verdict that was not the comparison it claimed, and a second `failed` for a bucket that has all
+# 8 of its rows (measured: `after/mut-flip-M1.txt`, `14 passed, 2 failed` for one red row).
+[ "$((pp + pf))" = 8 ] || { printf '  FATAL the G-PREFIX-1 table must have 8 rows (passed + failed), has %d\n' "$((pp + pf))"; fail=$((fail+1)); }
+[ "$((sp + sf))" = 5 ] || { printf '  FATAL the G-STATIC-6 table must have 5 rows (passed + failed), has %d\n' "$((sp + sf))"; fail=$((fail+1)); }
 # The controls bucket is pinned too: positive + third table + negative control = 3 rows, and the
 # third one is exactly the row the FLIP hook turns off -- so the pin is on RAN + SKIPPED. Without it
 # a bucket that lost a row (or a control row that never ran) is a silent 2/0, the size the other two
