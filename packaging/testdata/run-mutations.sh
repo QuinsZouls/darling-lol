@@ -11,7 +11,9 @@
 #
 # The LAST section is the negative control: it re-runs this file with one row's expectation
 # inverted (T1_MUTATION_FLIP=<row>) and fails if the table stays green. A table that cannot go red
-# is not a table.
+# is not a table. Under T1_MUTATION_FLIP this run IS the inverted run, so that control row cannot run
+# under its own hook: it is counted as SKIPped in the summary (never silently absent, never a PASS),
+# and the controls bucket is pinned on ran + skipped so a lost row cannot hide.
 #
 #   row  the 8 G-PREFIX-1 mutations of PLAN 4.1 (the positive run and the soundness control are
 #        reported separately, as controls)
@@ -45,12 +47,17 @@ ST=packaging/common/stage.sh
 # as review MAJOR-1: an rc=0 that a clean box cannot reproduce.)
 cp "$CP" "$WORK/check-prefix.sh"
 
-pass=0; fail=0
+pass=0; fail=0; skips=0
 pp=0; pf=0; sp=0; sf=0; cc=0; cf=0
 PHASE=ctrl
 ROWFAIL=0
 pass_row()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail_row()  { printf '  \033[31mFAIL\033[0m %s -- %s\n' "$1" "$2"; }
+# A row that did not run is COUNTED and NAMED and is never folded into `pass`: the same convention
+# run-deb-gates.sh:743-749 already uses (`skips` + ", K skipped" + "SKIP is not PASS"). The FLIP hook
+# below turns the negative-control row off, and `controls: 0 passed, 0 failed` used to be
+# indistinguishable from "the control ran and proved nothing".
+skip_row()  { skips=$((skips+1)); printf '  \033[33mSKIP\033[0m %s\n' "$1"; }
 sa() {  # sub-assert: sa LABEL GOT WANT
   if [ -z "$2" ]; then ROWFAIL=1; printf '      FAIL %s: EMPTY (command failed)\n' "$1"
   elif [ "$2" = "$3" ]; then printf '      ok   %s (%s)\n' "$1" "$2"
@@ -285,13 +292,30 @@ if [ -z "$FLIP" ]; then
   sa "the inverted run exits non-zero" "$nrc" 1
   sa "it fails the inverted row" "$(printf '%s' "$nout" | grep -c 'FAIL M1 exit')" 1
   end_row "negative control: T1_MUTATION_FLIP=M1 -> red"
+else
+  PHASE=ctrl
+  # This run IS the inverted run (T1_MUTATION_FLIP=$FLIP), so the control cannot run under its own
+  # hook: its row is SKIPped -- reported and counted, never a silent `controls: 0 passed, 0 failed`.
+  skip_row "negative control (T1_MUTATION_FLIP=$FLIP: the control row cannot run under its own hook)"
 fi
 
 sec "SUMMARY"
+# The bucket sizes are pinned BEFORE the totals are printed, so a FATAL is part of the number the
+# reader sees: a total printed before the checks that can change it is the same lie in a new place.
+# Each pin counts the bucket's ROWS (passed + failed), not its passed rows: under T1_MUTATION_FLIP=M1
+# one row of the G-PREFIX-1 table is RED, so a pin on `$pp` alone read "must have 8 rows, has 7" --
+# a verdict that was not the comparison it claimed, and a second `failed` for a bucket that has all
+# 8 of its rows (measured: `after/mut-flip-M1.txt`, `14 passed, 2 failed` for one red row).
+[ "$((pp + pf))" = 8 ] || { printf '  FATAL the G-PREFIX-1 table must have 8 rows (passed + failed), has %d\n' "$((pp + pf))"; fail=$((fail+1)); }
+[ "$((sp + sf))" = 5 ] || { printf '  FATAL the G-STATIC-6 table must have 5 rows (passed + failed), has %d\n' "$((sp + sf))"; fail=$((fail+1)); }
+# The controls bucket is pinned too: positive + third table + negative control = 3 rows, and the
+# third one is exactly the row the FLIP hook turns off -- so the pin is on RAN + SKIPPED. Without it
+# a bucket that lost a row (or a control row that never ran) is a silent 2/0, the size the other two
+# buckets must not have (review MINOR-1).
+[ "$((cc + skips))" = 3 ] || { printf '  FATAL the controls bucket must have 3 rows (ran + skipped), has %d\n' "$((cc + skips))"; fail=$((fail+1)); }
 printf '  G-PREFIX-1 mutations: %d passed, %d failed\n' "$pp" "$pf"
 printf '  G-STATIC-6 mutations: %d passed, %d failed\n' "$sp" "$sf"
-printf '  controls:             %d passed, %d failed\n' "$cc" "$cf"
-printf '  total:                %d passed, %d failed\n' "$pass" "$fail"
-[ "$pp" = 8 ] || { printf '  FATAL the G-PREFIX-1 table must have 8 rows, has %d\n' "$pp"; fail=$((fail+1)); }
-[ "$sp" = 5 ] || { printf '  FATAL the G-STATIC-6 table must have 5 rows, has %d\n' "$sp"; fail=$((fail+1)); }
+printf '  controls:             %d passed, %d failed, %d skipped\n' "$cc" "$cf" "$skips"
+printf '  total:                %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
+[ "$skips" = 0 ] || printf '  \033[33m%d row(s) SKIPped: SKIP is not PASS\033[0m\n' "$skips"
 [ "$fail" = 0 ] || exit 1

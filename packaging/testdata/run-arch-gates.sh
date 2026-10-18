@@ -37,10 +37,30 @@
 #                           four formats.)
 #   T6_GATES_BREAK=<name>   negative-control hook: break the OBJECT under test and re-run (see the
 #                           bottom of this file). Unset in a normal run.
-#   T6_GATES_CONTROLS=<spec> `all` (default) or a space-separated subset of the control names.
-#   T6_GATES_NO_CONTROLS=1  skip the control sweep. The gate rows are unchanged; the sweep is the
-#                           proof they can go red, so it is ON by default.
-#   T6_GATES_QUIET=1        print only the rows that are not PASS (what the sweep reads).
+#   T6_GATES_CONTROLS=<spec> `all` (default) or a space-separated subset of the control names. The
+#                           knob is READ (it was documented and inert). Matching is TOKEN-EXACT
+#                           (`all` is the literal word; otherwise a control is selected only when its
+#                           whole name appears as one word of the spec), so an element that spells no
+#                           control is IGNORED, not reported. The resolved list is what the sweep runs
+#                           AND what the skip account counts, and it is printed in the sweep's own
+#                           header: read THAT, not the spec. A spec that selects no control at all is
+#                           REFUSED before any summary (stderr + rc 2) -- an empty sweep is not a
+#                           green sweep.
+#   T6_GATES_NO_CONTROLS=1  do not run the control sweep. The gate rows are unchanged; the sweep is
+#                           the proof they can go red, so it is ON by default. A sweep that does
+#                           not run is REPORTED and counted as skipped (`K skipped` in the summary
+#                           plus one named SKIP per control), never folded into `passed` and never
+#                           fatal: nothing in CI runs this battery (grep -rn testdata .github/ ->
+#                           no match), so no input is *expected* here and there is no equivalent of
+#                           run-deb-gates.sh's T3_GATES_REQUIRE_DOCKER to mirror.
+#   T6_GATES_QUIET=1        print only the rows that are not PASS (what the sweep reads). A SKIP is
+#                           not a PASS, so the skip lines and every summary count still print.
+#   T6_GATES_EXPECT_ROWS=<n> the number of VERDICT rows this run must produce (default 24: PLAN 11's
+#                           T6 gate table). `rows` is asserted `== pass + fail` (the totals are
+#                           consistent) and `== this` (the run is COMPLETE): deleting one `end_row`
+#                           lowers `rows` and `pass` together, so consistency alone cannot see a row
+#                           that left the transcript -- the pin can. A degraded environment must
+#                           still account for every row (as a verdict, a SKIP or an UNMEASURED line).
 #   T6_GATES_KEEP=1         keep and print the private work directory, for a red row that needs its
 #                           artifacts inspected.
 #
@@ -129,8 +149,19 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else
   C_OK=; C_ER=; C_SK=; C_B=; C_0=
 fi
-rows=0; pass=0; fail=0; ROWFAIL=0
+# Every row ends in exactly one of three states: PASS, FAIL, or SKIP. A skipped row is COUNTED and
+# NAMED (see run-deb-gates.sh, the model for `skips`) and is never folded into `pass` -- a battery
+# that reports a green total over rows that never ran is the lie this counter exists to prevent.
+# `rows` is the number of rows that produced a verdict, so `rows == pass + fail`, asserted at the
+# summary: a counter without a definition is the same lie in a new place.
+rows=0; pass=0; fail=0; skips=0; ROWFAIL=0
+# control-row counters (G-ARCH-6, below the summary): ctl_no prints a FAIL and counts a control that
+# did not kill its row. It deliberately does NOT touch `fail`: the gate rows' verdict is printed by
+# the summary, and a control failure must not rewrite a number that was already reported.
+ctl_ok=0; ctl_bad=0; ctl_rows=0
 no2() { fail=$((fail+1)); printf '  %sFAIL%s %s\n' "$C_ER" "$C_0" "$1"; }
+ctl_no() { ctl_bad=$((ctl_bad+1)); printf '  %sFAIL%s %s\n' "$C_ER" "$C_0" "$1"; }
+skip() { skips=$((skips+1)); printf '  %sSKIP%s %s\n' "$C_SK" "$C_0" "$1"; }
 chk() { # chk LABEL GOT WANT -- a one-assertion row
   rows=$((rows+1))
   if [ -z "$2" ]; then no2 "$1: EMPTY result (command failed)"
@@ -617,46 +648,105 @@ sa "it reports on stderr"   "$(num pkg.install.txt 'FATAL .*>&2')" "2"
 end_row "G-ARCH-5 the pacman hook reports, it never fails the transaction"
 
 # ================================================================================================
+# A disabled sweep is decided BEFORE the summary: its rows are rows of this battery, so they have to
+# reach the summary's `skipped` field. A bare `note` (what this used to be) let the whole G-ARCH-6
+# sweep vanish from every total -- measured: `T6_GATES_NO_CONTROLS=1 T6_GATES_QUIET=1` printed
+# `24 rows: 24 passed, 0 failed` with `grep -ci 'control\|skip'` = 0 over the transcript.
+#
+# The sweep's row list is resolved ONCE (T6_GATES_CONTROLS=all|subset) so that the sweep and its skip
+# accounting iterate the SAME list: `K skipped` is then the same K as the controls that would run.
+# The knob was documented at the top of this file and never read: a subset request silently swept
+# everything. Same class, one level up -- the doc promised a row and no code ran it.
+sweep_rows=
+for c in $CONTROL_NAMES; do
+  case " ${T6_GATES_CONTROLS:-all} " in
+    " all " | *" $c "*) sweep_rows="$sweep_rows $c" ;;
+  esac
+done
+# An empty resolved list is not "no controls to run": it is an unaccountable sweep -- a typo in
+# T6_GATES_CONTROLS, or a CONTROL_NAMES that lost its rows -- and the summary would then read
+# "0 control(s) killed their row, 0 did not": green, with the whole proof absent. Refused (stderr +
+# rc 2) before ANY summary is printed, the way the T6_GATES_BREAK name check refuses an unknown
+# control -- but note WHERE this sits: the name check is near the top of this file, BEFORE the
+# measurement phase, while this one is AFTER it (the gate rows above are rows of the same run), so a
+# spec of pure typos has already paid for its container run when it is refused. The resolved list is
+# printed in the sweep's own header: that, and not the spec, is what an operator must read.
+if [ -z "$sweep_rows" ]; then
+  printf 'run-arch-gates: the control list is empty: T6_GATES_CONTROLS=%s selected no control (--list-controls)\n' \
+    "${T6_GATES_CONTROLS:-all}" >&2
+  exit 2
+fi
+sweep_skipped=0
+if [ -n "$CONTROLS" ]; then
+  sweep_skipped=1
+  sweep_n=0
+  skips0=$skips
+  for c in $sweep_rows; do
+    sweep_n=$((sweep_n + 1))
+    skip "G-ARCH-6 control $c (the sweep is off: T6_GATES_NO_CONTROLS / T6_GATES_BREAK)"
+  done
+  # The `skipped` field has to be the sweep's REAL row count, so it is asserted: a constant in place
+  # of the counter is the same lie in a new place. It is asserted as a DELTA (this file has no other
+  # skip site today, but the assertion must not depend on that).
+  [ "$((skips - skips0))" = "$sweep_n" ] \
+    || no2 "the skip counter is torn: $((skips - skips0)) SKIPped for $sweep_n control row(s)"
+fi
+
 sec "SUMMARY"
-printf '  %d rows: %s%d passed%s, %s%d failed%s\n' "$rows" \
-  "$C_OK" "$pass" "$C_0" "$C_ER" "$fail" "$C_0"
+# `rows` is one unambiguous thing (a row that produced a verdict): assert it, so the summary can
+# never read "fewer rows than passed" (the shape run-rpm-gates.sh had, where `chk` did not count).
+[ "$rows" = "$((pass + fail))" ] \
+  || no2 "the row counter is torn: rows=$rows != pass+fail=$((pass + fail))"
+# ... and assert that the run is COMPLETE, not only self-consistent. Deleting one whole row (an
+# `end_row` moved under an `if`) lowers `rows` and `pass` together: the line above stays satisfied and
+# the summary stays green over a transcript that lost a row. The expected number is a property of this
+# battery's contract with PLAN 11's T6 table, so it is pinned.
+[ "$rows" = "${T6_GATES_EXPECT_ROWS:-24}" ] \
+  || no2 "the run did not account for every gate row: rows=$rows, expected ${T6_GATES_EXPECT_ROWS:-24} (T6_GATES_EXPECT_ROWS)"
+printf '  %d rows: %s%d passed%s, %s%d failed%s, %d skipped\n' "$rows" \
+  "$C_OK" "$pass" "$C_0" "$C_ER" "$fail" "$C_0" "$skips"
+[ "$skips" = 0 ] \
+  || printf '  %s%d row(s) SKIPped: SKIP is not PASS%s\n' "$C_SK" "$skips" "$C_0"
 if [ "$fail" != 0 ]; then
   printf '\n%sFAILED%s -- %d row(s) red. A red row here is a red gate: fix the object, not the row.\n' \
     "$C_ER" "$C_0" "$fail" >&2
   exit 1
 fi
+[ "$sweep_skipped" = 0 ] || exit 0
 
 # ================================================================================================
 # THE CONTROL SWEEP. Each one breaks the OBJECT under test in the private copy, re-runs this whole
 # battery, and asserts that the row it names goes RED -- and that the break itself was not a no-op
 # (a mutation that changes nothing proves nothing). A control run never sweeps (recursion guard).
-if [ -n "$CONTROLS" ]; then
-  [ -n "$QUIET" ] || printf '\n%snote%s control sweep skipped (T6_GATES_NO_CONTROLS / T6_GATES_BREAK)\n' "$C_SK" "$C_0"
-  exit 0
-fi
-
-ctl_ok=0
-ctl_bad=0
-sec "G-ARCH-6  the negative controls (a row that cannot go red is not a row)"
-for c in $CONTROL_NAMES; do
+sec "G-ARCH-6  the negative controls (T6_GATES_BREAK=<name>, T6_GATES_CONTROLS='$sweep_rows')"
+for c in $sweep_rows; do
+  ctl_rows=$((ctl_rows + 1))
   want=$(ctl_row "$c")
   log=$WORK/ctl-$c.log
   T6_GATES_BREAK="$c" T6_GATES_NO_CONTROLS=1 T6_GATES_QUIET=1 bash "$0" > "$log" 2>&1
   cret=$?
   if grep -q 'BREAK-NOOP\|BREAK-UNKNOWN' "$log"; then
-    ctl_bad=$((ctl_bad+1)); no2 "control $c: the mutation itself is broken (see the log above)"
+    ctl_no "control $c: the mutation itself is broken (see the log above)"
   elif [ "$cret" = 0 ]; then
-    ctl_bad=$((ctl_bad+1)); no2 "control $c: the battery still passed with the object broken"
+    ctl_no "control $c: the battery still passed with the object broken"
   elif ! grep -qF "FAIL $want" "$log"; then
-    ctl_bad=$((ctl_bad+1)); no2 "control $c: '$want' did not go red"
+    ctl_no "control $c: '$want' did not go red"
     grep -F 'FAIL' "$log" | sed 's/^/      | /'
   else
     ctl_ok=$((ctl_ok+1))
     [ -n "$QUIET" ] || printf '  %sPASS%s control %-16s -> %s went red\n' "$C_OK" "$C_0" "$c" "$want"
   fi
 done
+# The sweep's own total is asserted the same way as the gate rows': k control names were declared,
+# so ctl_ok + ctl_bad must be k. A control row that vanishes is exactly the defect this file fixes.
+if [ "$((ctl_ok + ctl_bad))" != "$ctl_rows" ]; then
+  printf '  %sFAIL%s the sweep counter is torn: %d of %d control(s) reported\n' \
+    "$C_ER" "$C_0" "$((ctl_ok + ctl_bad))" "$ctl_rows"
+  printf '\n%sFAILED%s -- the control sweep cannot account for its own rows.\n' "$C_ER" "$C_0" >&2
+  exit 1
+fi
 printf '\n%d control(s) killed their row, %s%d did not%s\n' \
-  "$((ctl_ok + ctl_bad))" "$C_ER" "$ctl_bad" "$C_0"
+  "$ctl_ok" "$C_ER" "$ctl_bad" "$C_0"
 if [ "$ctl_bad" != 0 ]; then
   printf '\n%sFAILED%s -- %d control(s) did not kill their row: a gate without a control is a ghost row.\n' \
     "$C_ER" "$C_0" "$ctl_bad" >&2
