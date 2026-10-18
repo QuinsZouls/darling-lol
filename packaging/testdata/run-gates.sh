@@ -31,6 +31,12 @@
 # counter, not a constant: with T1_PLAN_FILE set the same battery prints `73 passed, 0 failed, 0
 # skipped`, with it unset `72 passed, 0 failed, 1 skipped`.
 #
+# 🚨 `skip()` here is NOT launch-harness.sh's `skip()` (review MINOR-2). That one is a PRECONDITION
+# guard: it exits 77 without ever painting a row. This one PAINTS a counted SKIP row in the body and
+# lets the battery run on -- the same function name for two deliberately different things, so reading
+# the two files together must not collapse them into one rule. And there is no `SKIP=` FIELD in this
+# battery's summary at all: the only SKIP here is a skip() ROW, and rc is unaffected by it.
+#
 # Companions: packaging/testdata/run-mutations.sh (the two mutation tables, self-asserting, with a
 # negative control), packaging/testdata/run-build-log-gates.sh (the install-log invariants of
 # scripts/build-packaging.sh, solved as 9 asserted cases) and packaging/testdata/state-probe.sh

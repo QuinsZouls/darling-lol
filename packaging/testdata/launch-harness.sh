@@ -38,7 +38,15 @@
 #     this field exists to prevent (review C1). Tarball mode stays a LEGAL, GREEN mode (rc 0):
 #     SKIP= is a report of what was NOT run, never a claim that it passed, and it is never added
 #     into PASS=. Staged mode reports SKIP=0 and no such line.
-#   * A SKIP exits 77, never 0: a skipped gate must not be a green row.
+#   * A skipped PRECONDITION (`skip()`) exits 77, never 0: a gate that could not run must not leave
+#     a green row. That is NOT the same thing as the SKIP= field of the bullet just above: SKIP= is
+#     carried by a GREEN rc-0 line and means "counted rows this mode did not need to run", never
+#     "rows that failed to run". Two meanings of SKIP three lines apart was review MINOR-2.
+#   * A log scanner doing `grep -i skip` on a LEGAL, GREEN tarball run WILL now hit it: the
+#     `skip R block NOT RUN` line and the `SKIP=14` in the summary. That is intended -- SKIP= is a
+#     report of what was not run, it is never a verdict, and it is never folded into PASS=
+#     (review NIT-2). The mechanism this replaced was silent, so treat a `skip`/`SKIP` hit as a
+#     question ("was that mode expected?") and read the line, not as a failure.
 #   * Hermetic (TASKS preamble rule 7): every fixture is built by this run inside one private
 #     mktemp -d, inputs are repo-relative, and nothing is read from a shared path. The negative
 #     controls (I', L4, L4b) are what make the total mean something.
@@ -54,8 +62,22 @@
 #     PLAN appendix A10f identify the EXECUTED artifacts but no longer match these shipped copies
 #     byte for byte (the patch rules are unchanged and both n==0 rules now fail loudly).
 #   * the R block is new: the rev-5 artifact had no way to look at the staged tree. Its /usr/local
-#     sweep is scoped to the whole staged HOST tree (the same scope check-prefix.sh (a) sweeps),
-#     not to usr/bin + usr/lib/darling-lol as it first shipped (review C2).
+#     sweep walks the WHOLE staged tree under L4_PKG_ROOT -- non-usr/ directories (etc/ ...) included
+#     -- with host-side symlinks FOLLOWED, minus the guest SDK, not just usr/bin + usr/lib/darling-lol
+#     as it first shipped (review C2). That is the set check-prefix.sh (a) REACHES, and the two now agree
+#     on the counter-trees that used to falsify the equality claim (review MAJOR-1). It is NOT
+#     claimed to be identical, and the two residual differences are deliberate and stated here:
+#     (i) PATH SOURCE -- this walks the tree on disk, while (a) walks the files.all list (a listed
+#     path that is absent is not swept here; a stray file not in files.all is); (ii) READ ERRORS --
+#     a per-file read error is swallowed by `2>/dev/null` here, while (a3) fails closed on one.
+#     🚨 Symlinks are followed the way (a) follows them -- by handing the LINK PATH to grep -- and
+#     NOT with `find -L`. `find -L` over this tree would follow the payload's OWN
+#     usr/libexec/darling/Volumes/DarlingEmulatedDrive -> / (C19) and walk the ENTIRE host
+#     (measured on this box: 1,096,791 files listed); the guest-SDK path filter suppresses those
+#     RESULTS but cannot stop the traversal. Enumerating `-type f -o -type l` and letting grep open
+#     each link cannot recurse out of the tree at all -- and that is exactly what (a) does: it is
+#     driven by the list, never recursive. `grep -d skip` drops a link to a DIRECTORY the same way
+#     (a)'s own `-d skip` does.
 set -u
 
 REPO=${L4_REPO:-}
@@ -510,24 +532,44 @@ lacks "M second run does NOT re-render (stamp is 'unknown' both times)" "$m2o" "
 # count; because a number that rots is the same lie in a new place, staged mode (the only mode that
 # can see the truth) asserts it against the row delta it actually measured just below, and goes RED
 # if a row is added or removed without bumping it.
+#
+# AM_ROWS is the SAME treatment for the other, larger block (review MINOR-1): the counted rows that
+# cases A-M emitted above. They had NO pinned total, so deleting one (measured: `chk "A rc" "$rc" 0`)
+# left staged `PASS=84 FAIL=0 SKIP=0` and tarball `PASS=70 FAIL=0 SKIP=14`, rc 0, with no signal --
+# the very class this change exists to close, one block up. AM_ROWS is asserted immediately below,
+# fail-only, in BOTH modes (cases A-M run in both, unlike R, which only staged mode can measure).
+# AM_ROWS + R_ROWS together cover EVERY counted row in this file, each checked in the mode that can
+# see it.
 R_ROWS=14
+AM_ROWS=71
+# MINOR-1: pin the A-M total. Fail-only -- a counted `ok` here would move the very total the constant
+# protects. Checked before r_rows0 is captured, so a failing AMBLOCK row cannot leak into the R
+# block's own delta (measured: deleting one A-M row reddens AMBLOCK alone, not RBLOCK too).
+[ "$((PASS + FAIL))" = "$AM_ROWS" ] \
+  || no "AMBLOCK: AM_ROWS=$AM_ROWS but cases A-M ran $((PASS + FAIL)) counted row(s) (bump AM_ROWS in the same commit)"
 r_rows0=$((PASS + FAIL))
 r_ran=no
 if [ -n "${L4_PKG_ROOT:-}" ]; then
   r_ran=yes
   echo; echo "=== R. the REAL staged tree (L4_PKG_ROOT=$L4_PKG_ROOT) ==="
   P=$L4_PKG_ROOT
-  # C2: the sweep SCOPE. R7 and R9 used to walk `$P/usr/bin $P/usr/lib/darling-lol` -- blind to
-  # usr/share/doc/** and to any future payload directory -- while the authoritative gate
-  # (check-prefix.sh part (a)) sweeps the whole host-side files.all list. So this "second opinion"
+  # C2/MAJOR-1: the sweep SCOPE. R7 and R9 used to walk `$P/usr/bin $P/usr/lib/darling-lol` -- blind
+  # to usr/share/doc/** and to any future payload directory -- while the authoritative gate
+  # (check-prefix.sh part (a)) reaches every host-side path files.all lists. So this "second opinion"
   # was narrower than it read: a /usr/local literal planted in
   # usr/share/doc/darling-lol/README-packaging.md left the old sweep green (R9=0). One scope
-  # variable, used by both rows, covers the whole staged `usr/` tree MINUS the guest SDK
-  # (usr/libexec/darling/**, whose ~362 /usr/local hits are Apple's and are a report in
-  # check-prefix.sh (b)/(e), never a failure) -- exactly the host-side scope that gate sweeps, so
-  # the two cannot disagree about which tree they are talking about.
-  sweep=$P/usr
-  sweep_skip=$sweep/libexec/darling
+  # variable, used by both rows, now walks the WHOLE staged tree -- non-usr/ directories such as
+  # etc/ included, because (a) sweeps them too -- MINUS the guest SDK (usr/libexec/darling/**, whose
+  # ~362 /usr/local hits are Apple's and are a report in check-prefix.sh (b)/(e), never a failure).
+  # Host-side SYMLINKS are followed by handing the LINK PATH to grep (`-type f -o -type l`), NOT with
+  # `find -L`, which would follow the payload's own Volumes/DarlingEmulatedDrive -> / out of the tree
+  # and walk the host (measured; see the header). The exclusion is by PATH UNDER THE TREE, so a
+  # symlink that merely POINTS at the SDK is still scanned (that is the counter-tree review MAJOR-1
+  # falsified with). The two residual differences from (a) are deliberate and stated in the header,
+  # not hidden: the scope SOURCE (this walks the tree on disk; (a) walks the files.all list) and READ
+  # ERRORS (this swallows a per-file read error via `2>/dev/null`; (a3) fails closed on one).
+  sweep=$P
+  sweep_skip=$P/usr/libexec/darling
   printf '  \033[33mnote\033[0m cases A-M above rendered with %s (the STAGED scripts, not the checkout'"'"'s)\n' "$scripts_dir"
   chk "R1 the staged wrapper exists and is executable" "$([ -x "$P/usr/bin/darling-lol" ] && echo yes || echo no)" yes
   chk "R2 the staged wrapper is a 2-token render of packaging/install/darling-lol.in" \
@@ -552,8 +594,8 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
   ntok=$(find "$P/usr/lib/darling-lol/tools" -type f -exec grep -l '@GUEST_HOME@' {} + 2>/dev/null | wc -l | tr -d ' ')
   printf '  \033[33mnote\033[0m %s staged template file(s) under tools/ still carry @GUEST_HOME@ (must be > 0)\n' "$ntok"
   chk "R6 the staged tools are UNRENDERED (count-agnostic, never a file count)" "$([ "$ntok" -gt 0 ] && echo yes || echo no)" yes
-  chk "R7 no staged file carries /home/runner (the D4 bug)" \
-      "$(find "$sweep" -type f ! -path "$sweep_skip/*" -exec grep -l '/home/runner' {} + 2>/dev/null | wc -l | tr -d ' ')" 0
+  chk "R7 no staged path carries /home/runner (the D4 bug)" \
+      "$(find "$sweep" \( -type f -o -type l \) ! -path "$sweep_skip/*" -exec grep -l -d skip '/home/runner' {} + 2>/dev/null | wc -l | tr -d ' ')" 0
   # R8/R8b: the R-4 split invariant (the doc dir holds exactly the launcher's own README).
   chk "R8 exactly ONE staged file under usr/share/doc/darling-lol (R-4)" \
       "$(find "$P/usr/share/doc/darling-lol" -type f | wc -l | tr -d ' ')" 1
@@ -567,10 +609,12 @@ if [ -n "${L4_PKG_ROOT:-}" ]; then
   # directions: no count is asserted, and a future merge needs no edit here. (If --print-allowlist
   # fails or answers nothing, R9a and R9 go red -- fail closed -- while R9b's comparison is then
   # trivially empty, which is why R9a exists as the non-empty assertion.)
-  # C2: the sweep is over the WHOLE staged host tree (`$sweep`, one variable, the same one R7 uses),
-  # not over two hand-picked subdirectories -- a subset scope is how the usr/share/doc gap lived.
-  printf '  \033[33mnote\033[0m R7/R9 sweep scope: %s (the whole staged host tree; guest SDK %s excluded)\n' "$sweep" "$sweep_skip"
-  hits=$(find "$sweep" -type f ! -path "$sweep_skip/*" -exec grep -Il 'usr/local' {} + 2>/dev/null \
+  # C2/MAJOR-1: the sweep is over the WHOLE staged tree (`$sweep`, one variable, the same one R7
+  # uses) and follows host-side symlinks by grepping the LINK PATH (never `find -L` -- see the
+  # header), not over two hand-picked subdirectories -- a subset scope is how the usr/share/doc gap
+  # lived.
+  printf '  \033[33mnote\033[0m R7/R9 sweep scope: the WHOLE staged tree under %s, symlinks followed via grep (never find -L), guest SDK %s excluded by path -- check-prefix.sh (a) reachability\n' "$sweep" "$sweep_skip"
+  hits=$(find "$sweep" \( -type f -o -type l \) ! -path "$sweep_skip/*" -exec grep -Il -d skip 'usr/local' {} + 2>/dev/null \
            | sed "s|^$P/||" | LC_ALL=C sort)
   wl=$(sh "$REPO/packaging/common/check-prefix.sh" --print-allowlist 2>/dev/null) || wl=""
   chk "R9a check-prefix.sh --print-allowlist answers with its allowlist (count-free)" \
