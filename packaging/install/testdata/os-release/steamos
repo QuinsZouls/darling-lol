@@ -1,0 +1,10 @@
+# The G-INSTALL-2b fixture that caught C24: SteamOS 3.7 on a Steam Deck. 🚨 ID_LIKE carries the
+# token *arch*, NOT the distribution's own name -- the `*archlinux*` regression dies HERE (and
+# only here: G-INSTALL-7 stays green for it). This is the plan's most likely target machine.
+NAME="SteamOS"
+VERSION_ID="3.7.13"
+ID=steamos
+ID_LIKE=arch
+BUILD_ID=20250822.1
+VARIANT_ID=steamdeck
+PRETTY_NAME="SteamOS"

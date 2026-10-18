@@ -34,11 +34,16 @@ ASSET_DIR=""
 VERSION=""
 CHANNEL=stable
 NO_VERIFY=0
-PREFIX=/usr/local
+PREFIX=/usr
 PREFIX_SET=0
 RUNTIME_ASSET=
 LAUNCHER_ASSET=
 TARBALL=
+# The tarball path's own record of what it unpacked (R2/MAJOR-1). It is NOT a package-owned path:
+# the payload is the /usr tree, and no package owns anything under /var/lib/darling-lol. The
+# documented removal recipe reads this file; cmake's installed-files.txt cannot be used for it
+# (39 007 absolute /usr/local lines from a different tree, 165 real paths missing).
+STATE_FILE=/var/lib/darling-lol/tar-installed-files.txt
 
 # --- helpers -------------------------------------------------------------------------------------
 # Only four verbs, so the script reads the same way everywhere: say/err go to the log, warn does not
@@ -75,11 +80,11 @@ Usage:
 Options:
   --method auto|apt|dnf|pacman|tar  how to install. auto (the default) picks the family's
                                     package manager from /etc/os-release; tar unpacks the release
-                                    tarball into /usr/local for a distribution with no package.
+                                    tarball into /usr for a distribution with no package.
   --version TAG                     the release to install, e.g. --version v0.1.2 (required on the
                                     stable channel).
   --channel stable|latest           where the assets come from (default: stable).
-  --prefix DIR                      where --method tar unpacks. Only /usr/local is accepted: the
+  --prefix DIR                      where --method tar unpacks. Only /usr is accepted: the
                                     install prefix is compiled into the runtime and cannot move.
   --asset-dir DIR                   install from assets already downloaded into DIR. Nothing is
                                     fetched; SHA256SUMS is still verified.
@@ -187,10 +192,15 @@ detect_distro() {
       # fixture die -- the plan's single most important target (EVIDENCE C24, §7.6).
       case " $DISTRO_LIKE " in
         *arch*)  FAMILY=arch; RELEASE=rolling ;;
-        *debian*|*ubuntu*) FAMILY=deb; RELEASE=bookworm ;;
+        # A Debian derivative (linuxmint, pop, ...): the .deb's Depends list is codename-specific,
+        # so use the UBUNTU_CODENAME the derivative's own os-release records (Mint 22 => noble).
+        # 🚨 NOT ubuntu_codename "$DISTRO_VER": a derivative's VERSION_ID is ITS version (22), not
+        # the Ubuntu one, and 22%%.* -> jammy would name the wrong Depends list (review NIT-2).
+        *ubuntu*)          FAMILY=deb; RELEASE=${UBUNTU_CODENAME:-bookworm} ;;
+        *debian*)          FAMILY=deb; RELEASE=bookworm ;;
         *rhel*|*fedora*)   FAMILY=rpm; RELEASE="fc41" ;;
         *) die "unsupported distribution '$DISTRO_ID' (ID_LIKE='$DISTRO_LIKE').
-       Use: $0 --method tar   (portable install into --prefix, default /usr/local)" ;;
+       Use: $0 --method tar   (portable install into --prefix, default /usr)" ;;
       esac ;;
   esac
   say "detected: $DISTRO_ID $DISTRO_VER -> family=$FAMILY release=$RELEASE"
@@ -376,6 +386,15 @@ tar_in() {  # set TARBALL from $ASSET_DIR: .tar.gz first, and never guess betwee
     [ "${#ASSET_MATCHES[@]}" -eq 0 ] && continue
     [ "${#ASSET_MATCHES[@]}" -eq 1 ] || ambiguous_asset "$pat"
     TARBALL=${ASSET_MATCHES[0]}
+    # 🚨 R1: the generic `*.tar.gz`/`*.tar.zst` fallback is what would otherwise hand the installer
+    # the v0.1.0-era pair -- darling-lol-linux-x86_64-<desc>-base-runtime.tar.gz and
+    # -runtime-artifacts.tar.gz -- and those are /usr/local trees. Refuse them BY NAME, so the
+    # outcome is a clean refusal and never a /usr/local tree extracted into a /usr install.
+    case "${TARBALL##*/}" in
+      darling-lol-linux-x86_64-*-base-runtime.tar.*|darling-lol-linux-x86_64-*-runtime-artifacts.tar.*)
+        die "$ASSET_DIR holds the legacy /usr/local pair, not the /usr tree this installer installs
+       (darling-lol-<ver>-linux-x86_64.tar.gz). Nothing was extracted." ;;
+    esac
     return 0
   done
   die "no tarball in $ASSET_DIR (expected darling-lol-<ver>-linux-x86_64.tar.gz)"
@@ -401,9 +420,11 @@ sdk_recorded_in() {  # sdk_recorded_in FILE -- the SDK path the per-user prefix 
 }
 
 preflight() {
-  # R13: a ~/.darling created by a /usr/local tarball records SDK=/usr/local/libexec/darling in
-  # etc/build. Installing the /usr packages next does not repair that prefix, and the failure
-  # ("the container will not start") is a confusing one two hours later. Detect it, print the
+  # R13: a ~/.darling created by an earlier tree records its SDK in etc/build -- the v0.1.0-era
+  # tarball records /usr/local/libexec/darling, the /usr tree (packages and the current tarball)
+  # records /usr/libexec/darling. When that path no longer exists the installed runtime and the
+  # prefix disagree, and the failure ("the container will not start") is a confusing one two
+  # hours later. Detect it, print the
   # recovery command, and touch nothing: the prefix is the user's, not the installer's.
   for home in $(state_homes); do
     build=$home/.darling/etc/build
@@ -491,15 +512,30 @@ assert_install() {
 }
 
 # --- §16.6 the tarball fallback ------------------------------------------------------------------
+# The tar path's prefix, in ONE place. --dry-run announces the prefix of the selected method, and
+# install_tar() writes into it; before T10b's mutation battery these were two independent statements
+# (the global `PREFIX=/usr` default that --dry-run printed, and install_tar's own `${PREFIX:-/usr}`)
+# which agreed only by accident. Mutating one of them left the gate's prefix cross-check green --
+# `mx_prefix_usrlocal` in run-mutations.sh. Both callers now go through set_tar_prefix().
+set_tar_prefix() {  # sets $PREFIX for --method tar: /usr, the prefix compiled in (LIBEXEC_PATH)
+  PREFIX=${PREFIX:-/usr}
+  [ "$PREFIX" = /usr ] || die "--prefix with --method tar must be /usr: the runtime's install
+       prefix is compiled in (LIBEXEC_PATH=/usr/libexec/darling). A relocated tree extracts
+       cleanly and then fails at mount(\"overlay\")."
+}
+
 install_tar() {
-  # Default prefix for the tarball path is /usr/local -- that is the prefix the *release*
-  # tarball was built with (EVIDENCE C7: the prefix is compiled in, so it cannot be chosen
-  # at install time). --prefix only relocates where we unpack, and is refused for anything
-  # other than /usr/local unless the tarball was built for it.
-  PREFIX=${PREFIX:-/usr/local}
-  [ "$PREFIX" = /usr/local ] || die "--prefix with --method tar must be /usr/local: the runtime
-       has its install prefix compiled in (LIBEXEC_PATH). A relocated tree installs cleanly and
-       then fails at mount(\"overlay\"). Use the .deb/.rpm/.pkg for a /usr install."
+  # The release tarball IS the /usr tree (D1, owner ruling R1 of the T10b review, 2026-10-17):
+  # packaging/common/build-tar.sh builds darling-lol-<ver>-linux-x86_64.tar.gz/.tar.zst with
+  # `-C "$pkg/root" -T files.all.rel` over the SAME staged tree as the packages, so its members
+  # are usr/bin/darling, usr/libexec/darling, usr/lib/darling-lol, usr/lib/binfmt.d/... -- and
+  # the archive's own gate asserts usr/bin/darling as -rwsr-xr-x (build-tar.sh's check_archive).
+  # PREFIX is therefore /usr, the prefix compiled in (LIBEXEC_PATH) and the prefix of the asset
+  # the glob above resolves. It is NOT /usr/local: only the v0.1.0-era
+  # darling-lol-linux-x86_64-<ver>-base-runtime.tar.gz pair is a /usr/local tree, and that name
+  # does not match anything in tar_in(). The cross-check below makes a future divergence fail
+  # BEFORE anything is extracted.
+  set_tar_prefix
   need_cmd tar
   # busybox tar has no --preserve-permissions (measured: 'unrecognized option'), and without it
   # the setuid bit is silently dropped (EVIDENCE C3). Detect and refuse.
@@ -512,23 +548,53 @@ install_tar() {
   [ "${EUID:-$(id -u)}" -eq 0 ] || die "the tarball install must run as root (it sets setuid root on
        $PREFIX/bin/darling). Re-run with sudo. See docs/PACKAGING.md for why there is no
        rootless mode."
-  free_kb=$(df -Pk /usr/local | awk 'NR==2{print $4}')
-  case "$free_kb" in
-    ''|*[!0-9]*) die "cannot determine the free space under /usr/local (df gave '$free_kb')" ;;
+  # The prefix this function demands must be the prefix of the asset it is about to unpack (info
+  # INFO-4 / ruling R6). One line of membership check turns the old failure mode -- ~589 MB of
+  # setuid tree extracted into /usr and THEN a failed assert_install against /usr/local -- into a
+  # clean refusal. The member list is sorted, so head -1 is stable; the two known trees are
+  # /usr (packages + the current tarball) and /usr/local (the v0.1.0-era pair).
+  first=$(tar -tf "$TARBALL" | head -1)
+  case "$first" in
+    usr/local/*) archive_prefix=/usr/local ;;
+    usr/*)       archive_prefix=/usr ;;
+    *)           archive_prefix="/${first%%/*}" ;;
   esac
-  [ "$free_kb" -gt 1500000 ] || die "need ~1.5 GB free under /usr/local, have $((free_kb/1024)) MB"
+  [ "$archive_prefix" = "$PREFIX" ] || die "$TARBALL is a $archive_prefix tree and --method tar
+       installs $PREFIX. The tarball this installer selects is the /usr tree
+       (darling-lol-<ver>-linux-x86_64.tar.gz); the /usr/local pair is the v0.1.0-era
+       -base-runtime/-runtime-artifacts asset, which this installer never picks. Nothing was
+       extracted."
+  # df names the tree that is actually written: the extraction is `-C /`, so what has to hold the
+  # space is the filesystem that carries $PREFIX (MENOR-1 of the review).
+  free_kb=$(df -Pk "$PREFIX" | awk 'NR==2{print $4}')
+  case "$free_kb" in
+    ''|*[!0-9]*) die "cannot determine the free space on the filesystem that holds $PREFIX (df gave '$free_kb')" ;;
+  esac
+  [ "$free_kb" -gt 1500000 ] || die "need ~1.5 GB free on the filesystem that holds $PREFIX, have $((free_kb/1024)) MB"
 
-  # Refuse to mix a tarball install with a package install (they own the same paths under
-  # different prefixes, and the package's Conflicts cannot see /usr/local).
+  # Refuse to mix a tarball install with a package install. Under R1's ruling this is a PATH-LEVEL
+  # collision in /usr, not two disjoint trees: the tar install writes the paths the packages own.
+  # The guard is one-way by construction (a package manager only sees its own database), so the
+  # reverse order is detected with the same database at the file level -- `dpkg -S /usr/bin/darling`
+  # (or `rpm -qf` / `pacman -Qo`) names the owner, and after a tar install it names nothing. That
+  # command is printed in docs/PACKAGING.md next to the removal recipe.
   if command -v dpkg >/dev/null && dpkg -s darling-lol >/dev/null 2>&1; then
     die "the darling-lol .deb is already installed. Remove it first: sudo apt remove darling-lol"
   fi
+  # The symmetric probe: an earlier tarball install is recorded in our own state file. Re-extracting
+  # over it is idempotent, so this is a message, not a refusal.
+  [ -e "$STATE_FILE" ] && say "a previous --method tar install is recorded in $STATE_FILE; re-extracting over it"
 
-  say "extracting to $PREFIX (this preserves setuid; ~589 MB, 40 139 paths)"
+  say "extracting to $PREFIX (this preserves setuid; ~589 MB)"
   tar -xp --numeric-owner --no-same-owner -f "$TARBALL" -C /
-  # The tarball ships install.sh at its root; remove the copy we just laid down so the
-  # installed tree matches the package layout.
-  rm -f /usr/local/install.sh /usr/local/README-INSTALL
+
+  # R2/MAJOR-1: record EXACTLY the members we unpacked, so the documented removal does not have to
+  # trust cmake's installed-files.txt (39 007 absolute /usr/local lines from another tree, with
+  # 165 real paths missing). Absolute paths, one member per line, no prefixing on removal. Written
+  # after a successful extract and only by this path: --dry-run never reaches install_tar.
+  mkdir -p "${STATE_FILE%/*}"
+  tar -tf "$TARBALL" | sed 's|/$||; s|^/*|/|' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  say "recorded $(wc -l < "$STATE_FILE" | tr -d ' ') unpacked members in $STATE_FILE"
 }
 
 # --- §16.7 per-user launcher step -----------------------------------------------------------------
@@ -544,14 +610,13 @@ prefix at ~/.darling on first run (a few minutes), then starts the Riot client. 
 asked for your Riot region.
 EOF
   else
-    # tarball path: no launcher package. Write the wrapper next to the templates.
+    # The /usr tarball carries the same launcher payload as the package (usr/bin/darling-lol), so
+    # this is only reached by a tree without it; name the path that tree uses (R1: /usr, not the
+    # legacy /usr/local pair).
     cat <<EOF
 
 Next step (as your normal user, NOT root):
-    /usr/local/share/darling-lol/darling-lol
-
-or add to your PATH:
-    ln -s /usr/local/share/darling-lol/darling-lol ~/.local/bin/darling-lol
+    /usr/bin/darling-lol
 EOF
   fi
 }
@@ -608,6 +673,10 @@ if [ "$DRY" = 1 ]; then
   # The root precondition has been checked above, which is the point of a dry run; everything
   # below this line writes or fetches, so the dry run stops here and says what would happen.
   base=$(release_url_base)
+  # 🚨 The announced prefix must be the prefix the selected method will actually write into
+  # (single source: set_tar_prefix). Cheap here, and it turns a --prefix the tar path cannot honour
+  # into a dry-run refusal instead of an announcement the install would contradict.
+  if [ "$METHOD" = tar ]; then set_tar_prefix; fi
   say "dry run: nothing has been fetched, unpacked or modified."
   say "dry run: family=$FAMILY release=$RELEASE method=$METHOD prefix=$PREFIX"
   say "dry run: assets would come from $base"
