@@ -28,8 +28,11 @@
 # therefore no expectation to violate: a skip is REPORTED, never turned into a failure, and rc stays
 # 0. (Contrast run-deb-gates.sh, where the docker row's input IS expected in CI and T3_GATES_REQUIRE_
 # DOCKER exists to force it; nothing here has a comparable expectation.) The counter is a real
-# counter, not a constant: with T1_PLAN_FILE set the same battery prints `74 passed, 0 failed, 0
-# skipped`, with it unset `73 passed, 0 failed, 1 skipped`.
+# counter, not a constant: with T1_PLAN_FILE set the same battery prints `76 passed, 0 failed, 0
+# skipped`, with it unset `75 passed, 0 failed, 1 skipped` (both pins NON-root). The pins are
+# uid-dependent: as root the G-BUILDALL-0 readability row paints a counted SKIP by design (root
+# reads everything, so the probe cannot fire), which makes the T1_PLAN_FILE-set pin
+# `75 passed, 0 failed, 1 skipped` there.
 #
 # 🚨 `skip()` here is NOT launch-harness.sh's `skip()` (review MINOR-2). That one is a PRECONDITION
 # guard: it exits 77 without ever painting a row. This one PAINTS a counted SKIP row in the body and
@@ -293,6 +296,42 @@ blleft=$(find "$WORK/blroot/usr/lib/darling-lol" \
            \( -type f \( -name '*.pyc' -o -name '*.pyo' \) \) 2>/dev/null | wc -l | tr -d ' ')
 chk "the planted stale cache is held (1), staging exits 0 (0), zero __pycache__/pyc/pyo staged (0)" \
   "$have $blrc $blleft" "1 0 0"
+
+# --- build-all.sh's privilege/provenance pre-flights (third member of the privilege class) -------
+# The T8 launcher fix and the --no-preserve=ownership fix guard WRITES into the root-owned staging
+# tree; these two rows guard build-all.sh's READS of it (CI run 39218437320: three "cp: cannot
+# open ... Permission denied" lines on the mode-0700 CUPS backends, buried as "FATAL sh failed").
+# One row per probe, each ONE counted row of composite asserts, because no pinned counter may move
+# (the G-LAUNCH-2 rule): the scratch tree is planted under $WORK, never in the shared fixture, and
+# as root -- where every file reads and the probe CANNOT fire -- the first row paints a counted
+# SKIP instead of a silent pass (a row that passes by not testing is the anti-pattern this battery
+# exists to catch; the summary prints "SKIP is not PASS" for it).
+sec "G-BUILDALL-0  build-all.sh pre-flights: unreadable payload + CI provenance"
+bp=$WORK/bp
+mkdir -p "$bp/dist/pkg/root/usr/libexec/darling/usr/libexec/cups/backend"
+printf 'x\n' > "$bp/dist/pkg/root/usr/libexec/darling/usr/libexec/cups/backend/ipp"
+if [ "$(id -u)" = 0 ]; then
+  skip "readability pre-flight dies on a chmod 000 payload file, naming it + the sudo -E remedy (this battery runs as root: root reads every file, so the probe cannot fire here -- SKIP is not PASS)"
+else
+  # the class as CI measured it: an entry the invoking uid cannot read.
+  chmod 000 "$bp/dist/pkg/root/usr/libexec/darling/usr/libexec/cups/backend/ipp"
+  brc=0; bout=$(CI='' DARLING_PKG_DIST=$bp/dist sh packaging/common/build-all.sh v9.9.9 2>&1) || brc=$?
+  chmod 644 "$bp/dist/pkg/root/usr/libexec/darling/usr/libexec/cups/backend/ipp"
+  # control: the same tree once readable must get PAST the probe -- it dies at the next
+  # fail-closed check (the stage.sh lists), which is what proves the probe passed, not skipped.
+  crc=0; cout=$(CI='' DARLING_PKG_DIST=$bp/dist sh packaging/common/build-all.sh v9.9.9 2>&1) || crc=$?
+  chk "chmod 000 dies naming the path + remedy (1 1 1); readable tree passes the probe (1 1)" \
+    "$brc $(printf '%s\n' "$bout" | grep -c 'cups/backend/ipp') $(printf '%s\n' "$bout" | grep -c 'sudo -E') $crc $(printf '%s\n' "$cout" | grep -c 'files.all is missing')" \
+    "1 1 1 1 1"
+fi
+# CI provenance: no uid involved, so this row runs under root too. Empty COMMIT under CI=1 must
+# die at the boundary with the sudo -E remedy; all three present must pass the probe (the control
+# again dies at the missing stage.sh lists -- the probe is upstream of that check).
+frc=0; fout=$(CI=1 COMMIT='' REF=x RUN=x DARLING_PKG_DIST=$bp/dist sh packaging/common/build-all.sh v9.9.9 2>&1) || frc=$?
+prc=0; pout=$(CI=1 COMMIT=x REF=x RUN=x DARLING_PKG_DIST=$bp/dist sh packaging/common/build-all.sh v9.9.9 2>&1) || prc=$?
+chk "CI provenance: empty COMMIT dies naming the boundary + remedy (1 1 1); full env passes it (1 1 0)" \
+  "$frc $(printf '%s\n' "$fout" | grep -c 'privilege boundary') $(printf '%s\n' "$fout" | grep -c 'sudo -E') $prc $(printf '%s\n' "$pout" | grep -c 'files.all is missing') $(printf '%s\n' "$pout" | grep -c 'privilege boundary')" \
+  "1 1 1 1 1 0"
 
 sec "G-PREFIX-1  check-prefix.sh: the positive run"
 rm -rf "$WORK/pfx" && bash packaging/testdata/mkprefixfixture.sh "$WORK/pfx" >/dev/null

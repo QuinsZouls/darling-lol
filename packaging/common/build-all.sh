@@ -95,6 +95,69 @@ else
   Run scripts/build-packaging.sh (it needs x86-64) and then packaging/common/stage.sh, or use the
   'fixture' mode."
 fi
+
+# --- 0. pre-flights: read access and CI provenance, BEFORE the first builder --------------------
+# Section 1..3 hands the tree to four builders that read it and copy it. Two things must be true
+# before they start, and each is cheaper to learn here than halfway through a format.
+#
+# (a) READABILITY of the payload. scripts/build-packaging.sh installs the DESTDIR with sudo (it
+# sets the setuid bit on usr/bin/darling), so on CI $pkg/root is root-owned -- including guest
+# files that are mode 0700 BY DESIGN, the CUPS backends usr/libexec/cups/backend/{ipp,lpd,dnssd}.
+# An unprivileged copy of those dies with "cp: cannot open '…/ipp' for reading: Permission denied"
+# and run()'s wrapper buries it as "FATAL sh failed" ($1 = "sh"): run 39218437320 lost the real
+# cause that way. Fail closed HERE, naming the path and the remedy instead.
+#   - files AND directories, because a builder needs to read both.
+#   - NO symlink following (find's default -P mode, and the test is restricted to -type f/-type
+#     d): the tree carries usr/libexec/darling/Volumes/DarlingEmulatedDrive -> /, and a walk that
+#     follows it escapes the tree entirely (C19).
+#   - find's rc and stderr are captured SEPARATELY from its output (no pipe to hide the status):
+#     stderr non-empty means the sweep could not complete, and an incomplete sweep is fail-closed
+#     too -- a probe that cannot see the tree must not vouch for it.
+# Runs in BOTH modes. Fixture trees are small and user-owned, so the probe is a no-op there; and
+# as root every file reads, so a clean probe under sudo is the CORRECT reading, not a gap: the CI
+# shape IS root (mirroring the T8 launcher step and the docker gates that verify these builders
+# as root).
+if [ -d "$pkg/root" ]; then
+  _find_err=$(mktemp "${TMPDIR:-/tmp}/build-all-find-err.XXXXXX")
+  _frc=0
+  _unread=$(find "$pkg/root" \( -type f -o -type d \) ! -readable -print 2> "$_find_err") || _frc=$?
+  _ferr=$(cat "$_find_err" 2>/dev/null || true)
+  rm -f "$_find_err"
+  if [ -n "$_unread" ]; then
+    _n=$(printf '%s\n' "$_unread" | wc -l | tr -d ' ')
+    fatal "cannot read $_n entries under $pkg/root as uid $(id -u):
+$(printf '%s\n' "$_unread" | head -5 | sed 's/^/    /')
+  the tree is root-owned after scripts/build-packaging.sh's sudo install (the setuid bit on
+  usr/bin/darling): run this step with the privileges that created the tree (CI: under sudo -E,
+  like the T8 launcher staging step)"
+  fi
+  if [ "$_frc" -ne 0 ] || [ -n "$_ferr" ]; then
+    fatal "the readability sweep of $pkg/root did not complete (find rc=$_frc):
+$(printf '%s\n' "$_ferr" | head -5 | sed 's/^/    /')
+  fail closed rather than hand a tree it could not read to the builders: fix the sweep's
+  environment, or run this step with the privileges that created the tree (CI: under sudo -E)"
+  fi
+fi
+
+# (b) CI PROVENANCE. The workflow's env: block supplies COMMIT/REF/RUN for
+# BUILD-INFO-packages.txt (PLAN 12.3). Without them build-info.sh falls back to "local" /
+# "unknown" -- correct defaults for a laptop, a silent provenance lie for a CI build. The way the
+# environment gets lost is a plain sudo without -E (env_reset), i.e. exactly the privilege
+# boundary this step crosses, so the fatal names that remedy. Non-CI runs skip the check
+# entirely: local builds are supposed to say "local".
+if [ -n "${CI:-}" ]; then
+  _miss=
+  [ -n "${COMMIT:-}" ] || _miss="$_miss COMMIT"
+  [ -n "${REF:-}" ] || _miss="$_miss REF"
+  [ -n "${RUN:-}" ] || _miss="$_miss RUN"
+  if [ -n "$_miss" ]; then
+    fatal "CI is set but the provenance environment is empty:$_miss
+  BUILD-INFO-packages.txt would record build-info.sh's 'local'/'unknown' defaults instead of
+  this run (PLAN 12.3): the environment did not survive the privilege boundary -- run this step
+  with sudo -E (or sudo --preserve-env=COMMIT,REF,RUN)"
+  fi
+fi
+
 for f in files.all files.runtime files.launcher; do
   # In fixture mode the first builder stages the tree; in production the T1 contract says stage.sh
   # already ran, so a missing list is a broken pipeline rather than something to paper over.
