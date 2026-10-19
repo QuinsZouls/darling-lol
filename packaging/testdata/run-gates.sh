@@ -28,11 +28,13 @@
 # therefore no expectation to violate: a skip is REPORTED, never turned into a failure, and rc stays
 # 0. (Contrast run-deb-gates.sh, where the docker row's input IS expected in CI and T3_GATES_REQUIRE_
 # DOCKER exists to force it; nothing here has a comparable expectation.) The counter is a real
-# counter, not a constant: with T1_PLAN_FILE set the same battery prints `76 passed, 0 failed, 0
-# skipped`, with it unset `75 passed, 0 failed, 1 skipped` (both pins NON-root). The pins are
-# uid-dependent: as root the G-BUILDALL-0 readability row paints a counted SKIP by design (root
-# reads everything, so the probe cannot fire), which makes the T1_PLAN_FILE-set pin
-# `75 passed, 0 failed, 1 skipped` there.
+# counter, not a constant: all four uid x T1_PLAN_FILE modes are pinned -- non-root + PLAN set:
+# `76 passed, 0 failed, 0 skipped`; non-root + PLAN unset: `75 passed, 0 failed, 1 skipped` (the
+# PLAN row's own skip); root + PLAN set: `75 passed, 0 failed, 1 skipped`; root + PLAN unset:
+# `74 passed, 0 failed, 2 skipped`. The uid-dependent pin is the G-BUILDALL-0 readability row: as
+# root it paints a counted SKIP by design (root reads everything, so the probe cannot fire) --
+# replacing one of the 76 passes when the PLAN row runs, and standing as the second skip when it
+# does not.
 #
 # 🚨 `skip()` here is NOT launch-harness.sh's `skip()` (review MINOR-2). That one is a PRECONDITION
 # guard: it exits 77 without ever painting a row. This one PAINTS a counted SKIP row in the body and
@@ -326,12 +328,17 @@ else
 fi
 # CI provenance: no uid involved, so this row runs under root too. Empty COMMIT under CI=1 must
 # die at the boundary with the sudo -E remedy; all three present must pass the probe (the control
-# again dies at the missing stage.sh lists -- the probe is upstream of that check).
+# again dies at the missing stage.sh lists -- the probe is upstream of that check). NIT-1: an
+# empty DARLING_PKG_DIST -- the same workflow env: contract, the variable that decides WHERE the
+# formats are written -- must die at that SAME boundary; set-but-empty on purpose, so the probe's
+# [ -n ... ] has to treat empty like unset. The other invocations keep passing the fixture dist
+# explicitly; only this one drops it (the probe fires before dist= resolves the fallback).
 frc=0; fout=$(CI=1 COMMIT='' REF=x RUN=x DARLING_PKG_DIST=$bp/dist sh packaging/common/build-all.sh v9.9.9 2>&1) || frc=$?
 prc=0; pout=$(CI=1 COMMIT=x REF=x RUN=x DARLING_PKG_DIST=$bp/dist sh packaging/common/build-all.sh v9.9.9 2>&1) || prc=$?
-chk "CI provenance: empty COMMIT dies naming the boundary + remedy (1 1 1); full env passes it (1 1 0)" \
-  "$frc $(printf '%s\n' "$fout" | grep -c 'privilege boundary') $(printf '%s\n' "$fout" | grep -c 'sudo -E') $prc $(printf '%s\n' "$pout" | grep -c 'files.all is missing') $(printf '%s\n' "$pout" | grep -c 'privilege boundary')" \
-  "1 1 1 1 1 0"
+erc=0; eout=$(CI=1 COMMIT=x REF=x RUN=x DARLING_PKG_DIST='' sh packaging/common/build-all.sh v9.9.9 2>&1) || erc=$?
+chk "CI provenance: empty COMMIT dies naming the boundary + remedy (1 1 1); full env passes it (1 1 0); empty DARLING_PKG_DIST dies at the same boundary (1 1 1)" \
+  "$frc $(printf '%s\n' "$fout" | grep -c 'privilege boundary') $(printf '%s\n' "$fout" | grep -c 'sudo -E') $prc $(printf '%s\n' "$pout" | grep -c 'files.all is missing') $(printf '%s\n' "$pout" | grep -c 'privilege boundary') $erc $(printf '%s\n' "$eout" | grep -c 'privilege boundary') $(printf '%s\n' "$eout" | grep -c 'sudo -E')" \
+  "1 1 1 1 1 0 1 1 1"
 
 sec "G-PREFIX-1  check-prefix.sh: the positive run"
 rm -rf "$WORK/pfx" && bash packaging/testdata/mkprefixfixture.sh "$WORK/pfx" >/dev/null
