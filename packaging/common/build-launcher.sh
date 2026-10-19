@@ -81,22 +81,23 @@ fi
 # 3. The payload. The tools/ tree is idempotent by construction: the target directory is
 #    recreated, so a re-run (a re-dispatched job) cannot leave a stale file behind.
 #
-# Every write into the staging tree below carries `2>/dev/null || stage_fail` -- the REAL
-# writes are the guard, there is no probe. On CI usr/** is root-owned after
-# scripts/build-packaging.sh's sudo install (it sets the setuid bit on usr/bin/darling), so an
-# unprivileged run dies here with ONE actionable line instead of a raw mid-payload
-# `mkdir`/`install:`/`cp:` error (run 39136194994).
+# Every write into the staging tree below carries `|| stage_fail` -- the REAL writes are the
+# guard, there is no probe. The raw command's errno line is deliberately NOT suppressed (round-2
+# N1: silenced, it let the FATAL assert an ownership cause for ENOTDIR/EACCES/EROFS failures);
+# only the FATAL line below is actionable, and it states a hypothesis, not a known cause (N1b).
+# On CI usr/** is root-owned after scripts/build-packaging.sh's sudo install (it sets the setuid
+# bit on usr/bin/darling), so an unprivileged run dies there with that one line (run 39136194994).
 stage_fail() {
-  die "cannot stage the launcher payload into $root as uid $(id -u): usr/** is root-owned after scripts/build-packaging.sh's sudo install (it sets the setuid bit on usr/bin/darling); run this step with the privileges that created the tree (CI: under sudo)"
+  die "cannot stage the launcher payload into $root as uid $(id -u); if usr/** is root-owned (scripts/build-packaging.sh's sudo install, for the setuid bit on usr/bin/darling) run this step with the privileges that created the tree (CI: under sudo)"
 }
-mkdir -p "$root/usr/bin" "$root/usr/share/doc/darling-lol" 2>/dev/null || stage_fail
-rm -rf "$root/usr/lib/darling-lol" 2>/dev/null || stage_fail
-mkdir -p "$root/usr/lib/darling-lol/scripts" "$root/usr/lib/darling-lol/tools" 2>/dev/null || stage_fail
-install -m 0755 "$tmp" "$root/usr/bin/darling-lol" 2>/dev/null || stage_fail
+mkdir -p "$root/usr/bin" "$root/usr/share/doc/darling-lol" || stage_fail
+rm -rf "$root/usr/lib/darling-lol" || stage_fail
+mkdir -p "$root/usr/lib/darling-lol/scripts" "$root/usr/lib/darling-lol/tools" || stage_fail
+install -m 0755 "$tmp" "$root/usr/bin/darling-lol" || stage_fail
 install -m 0755 "$repo/scripts/configure.py" "$repo/scripts/common.py" \
-  "$root/usr/lib/darling-lol/scripts/" 2>/dev/null || stage_fail
-cp -a "$repo/tools/." "$root/usr/lib/darling-lol/tools/" 2>/dev/null || stage_fail
-install -m 0644 "$readme" "$root/usr/share/doc/darling-lol/README-packaging.md" 2>/dev/null || stage_fail
+  "$root/usr/lib/darling-lol/scripts/" || stage_fail
+cp -a "$repo/tools/." "$root/usr/lib/darling-lol/tools/" || stage_fail
+install -m 0644 "$readme" "$root/usr/share/doc/darling-lol/README-packaging.md" || stage_fail
 
 # 4. Fail closed on the result. stage.sh step 4's guard is `[ -e "$root/$p" ] && ...`, which
 #    makes an absent payload SILENT: files.launcher ends up 0 bytes and stage.sh exits 0, and
