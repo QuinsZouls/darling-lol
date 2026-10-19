@@ -668,7 +668,11 @@ jobs:
           # (wrapper + scripts/{configure,common}.py + tools/** + README-packaging.md) into the
           # staging tree. Must run AFTER build-packaging.sh (whose pre-flight refuses a non-empty
           # tree) and BEFORE stage.sh (whose step 3b sweeps the payload and whose step 4 lists it).
-          sh packaging/common/build-launcher.sh "$DARLING_PKG_DIST/pkg/root"
+          # Runs under sudo: scripts/build-packaging.sh installs under sudo (the setuid bit on
+          # usr/bin/darling), so usr/** in the staging tree is root-owned and this step must run
+          # as the tree's owner; stage.sh step 2 and build-arch.sh's fakeroot-equivalent ownership
+          # guard require that. Unprivileged it failed on run 39136194994 (`mkdir '.../usr/share': Permission denied`).
+          sudo sh packaging/common/build-launcher.sh "$DARLING_PKG_DIST/pkg/root"
 
       - name: Stage the tree and build every format
         shell: bash

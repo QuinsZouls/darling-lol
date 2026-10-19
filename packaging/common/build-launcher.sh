@@ -51,6 +51,16 @@ esac
 
 root=${1:-${DARLING_PKG_DIST:-dist}/pkg/root}
 [ -n "$root" ] || die "empty ROOT"
+# Write pre-flight. Probe with a REAL create -- `[ -w ]` and `mkdir -p` on an existing directory
+# can both succeed where the create itself would fail. On CI the tree's usr/** is root-owned
+# (scripts/build-packaging.sh installs under sudo, for the setuid bit on usr/bin/darling), and an
+# unprivileged run failed here with a raw mid-copy `mkdir: cannot create directory` (run 39136194994).
+probe="$root/usr/.build-launcher-write-probe.$$"
+mkdir -p "$probe" 2>/dev/null || die \
+  "staging tree $root is not writable by uid $(id -u); scripts/build-packaging.sh installs under" \
+  "sudo to set the setuid bit, so usr/** is root-owned; run this script as the tree's owner" \
+  "(CI: the workflow step runs it under sudo)"
+rmdir "$probe"
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 
 sdk=${DARLING_LAUNCHER_SDK:-/usr/libexec/darling}
