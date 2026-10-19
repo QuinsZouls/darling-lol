@@ -51,16 +51,6 @@ esac
 
 root=${1:-${DARLING_PKG_DIST:-dist}/pkg/root}
 [ -n "$root" ] || die "empty ROOT"
-# Write pre-flight. Probe with a REAL create -- `[ -w ]` and `mkdir -p` on an existing directory
-# can both succeed where the create itself would fail. On CI the tree's usr/** is root-owned
-# (scripts/build-packaging.sh installs under sudo, for the setuid bit on usr/bin/darling), and an
-# unprivileged run failed here with a raw mid-copy `mkdir: cannot create directory` (run 39136194994).
-probe="$root/usr/.build-launcher-write-probe.$$"
-mkdir -p "$probe" 2>/dev/null || die \
-  "staging tree $root is not writable by uid $(id -u); scripts/build-packaging.sh installs under" \
-  "sudo to set the setuid bit, so usr/** is root-owned; run this script as the tree's owner" \
-  "(CI: the workflow step runs it under sudo)"
-rmdir "$probe"
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 
 sdk=${DARLING_LAUNCHER_SDK:-/usr/libexec/darling}
@@ -90,14 +80,23 @@ fi
 
 # 3. The payload. The tools/ tree is idempotent by construction: the target directory is
 #    recreated, so a re-run (a re-dispatched job) cannot leave a stale file behind.
-mkdir -p "$root/usr/bin" "$root/usr/share/doc/darling-lol"
-rm -rf "$root/usr/lib/darling-lol"
-mkdir -p "$root/usr/lib/darling-lol/scripts" "$root/usr/lib/darling-lol/tools"
-install -m 0755 "$tmp" "$root/usr/bin/darling-lol"
+#
+# Every write into the staging tree below carries `2>/dev/null || stage_fail` -- the REAL
+# writes are the guard, there is no probe. On CI usr/** is root-owned after
+# scripts/build-packaging.sh's sudo install (it sets the setuid bit on usr/bin/darling), so an
+# unprivileged run dies here with ONE actionable line instead of a raw mid-payload
+# `mkdir`/`install:`/`cp:` error (run 39136194994).
+stage_fail() {
+  die "cannot stage the launcher payload into $root as uid $(id -u): usr/** is root-owned after scripts/build-packaging.sh's sudo install (it sets the setuid bit on usr/bin/darling); run this step with the privileges that created the tree (CI: under sudo)"
+}
+mkdir -p "$root/usr/bin" "$root/usr/share/doc/darling-lol" 2>/dev/null || stage_fail
+rm -rf "$root/usr/lib/darling-lol" 2>/dev/null || stage_fail
+mkdir -p "$root/usr/lib/darling-lol/scripts" "$root/usr/lib/darling-lol/tools" 2>/dev/null || stage_fail
+install -m 0755 "$tmp" "$root/usr/bin/darling-lol" 2>/dev/null || stage_fail
 install -m 0755 "$repo/scripts/configure.py" "$repo/scripts/common.py" \
-  "$root/usr/lib/darling-lol/scripts/"
-cp -a "$repo/tools/." "$root/usr/lib/darling-lol/tools/"
-install -m 0644 "$readme" "$root/usr/share/doc/darling-lol/README-packaging.md"
+  "$root/usr/lib/darling-lol/scripts/" 2>/dev/null || stage_fail
+cp -a "$repo/tools/." "$root/usr/lib/darling-lol/tools/" 2>/dev/null || stage_fail
+install -m 0644 "$readme" "$root/usr/share/doc/darling-lol/README-packaging.md" 2>/dev/null || stage_fail
 
 # 4. Fail closed on the result. stage.sh step 4's guard is `[ -e "$root/$p" ] && ...`, which
 #    makes an absent payload SILENT: files.launcher ends up 0 bytes and stage.sh exits 0, and
