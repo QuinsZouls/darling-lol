@@ -164,7 +164,11 @@ check_no_tokens() {
 build_tree() {
   rm -rf "$1"
   mkdir -p "$1"
-  cp -a "$root/." "$1/"
+  # --no-preserve=ownership: coreutils cp SILENTLY clears setuid/setgid when it cannot chown to
+  # the source owner (measured: rc 0, no diagnostic, 4755 -> 755 copying the root-owned staging
+  # tree unprivileged). The ownership copy is not needed: dpkg-deb --root-owner-group (step 7)
+  # forces root:root in the archive -- this flag is what keeps usr/bin/darling at 4755.
+  cp -a --no-preserve=ownership "$root/." "$1/"
   while IFS= read -r p; do
     # `/` would mean "delete the whole tree": the T1 fix that stopped -printf emitting the
     # starting point made this impossible, and this guard keeps it that way.

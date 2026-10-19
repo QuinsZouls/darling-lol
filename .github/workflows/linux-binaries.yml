@@ -668,7 +668,17 @@ jobs:
           # (wrapper + scripts/{configure,common}.py + tools/** + README-packaging.md) into the
           # staging tree. Must run AFTER build-packaging.sh (whose pre-flight refuses a non-empty
           # tree) and BEFORE stage.sh (whose step 3b sweeps the payload and whose step 4 lists it).
-          sh packaging/common/build-launcher.sh "$DARLING_PKG_DIST/pkg/root"
+          # Runs with the privileges that created the tree (CI: under sudo). The only requirement
+          # is WRITE ACCESS to the root-owned 0755 usr/** that scripts/build-packaging.sh's sudo
+          # install leaves behind (it sets the setuid bit on usr/bin/darling). The tree must stay
+          # root-owned: chown is forbidden -- it would leave the setuid binary owned by the
+          # builder, and chown itself strips the setuid bit. Unprivileged it failed on run
+          # 39136194994 (job 117712523165), quoting verbatim (path elided with '…'):
+          #   mkdir: cannot create directory ‘…/dist/pkg/root/usr/share’: Permission denied
+          # -E, not plain sudo: the script's documented DARLING_LAUNCHER_SDK /
+          # DARLING_LAUNCHER_TEMPLATES overrides must survive sudo's env_reset (repo precedent:
+          # scripts/build-packaging.sh's install runs `sudo -E` too).
+          sudo -E sh packaging/common/build-launcher.sh "$DARLING_PKG_DIST/pkg/root"
 
       - name: Stage the tree and build every format
         shell: bash

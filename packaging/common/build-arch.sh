@@ -128,7 +128,18 @@ root=$work/root
 tmp=$work/tmp
 rm -rf "$work"
 mkdir -p "$tmp"
-cp -a "$pkg/root/." "$root/"
+# --no-preserve=ownership: coreutils cp SILENTLY clears setuid/setgid when it cannot chown to
+# the source owner (measured: rc 0, no diagnostic, 4755 -> 755 copying the root-owned staging
+# tree unprivileged). Ownership is irrelevant here -- bsdtar --uid 0 --gid 0 normalizes the
+# archive members -- but the MODE is recorded from disk into .MTREE, so it must survive.
+cp -a --no-preserve=ownership "$pkg/root/." "$root/"
+
+# The setuid bit is the runtime's contract (PLAN 13.1): assert it on the copy BEFORE archiving,
+# so a degraded copy can never silently ship a non-setuid runtime in the .pkg.tar.zst (F2: an
+# unprivileged cp -a used to produce .MTREE mode=755 and a -rwxr-xr-x member, rc 0). The
+# `|| echo missing` keeps a missing file a named failure, not a pass.
+mode_4755=$(stat -c '%a' "$root/usr/bin/darling" 2>/dev/null || echo missing)
+[ "$mode_4755" = 4755 ] || fatal "$root/usr/bin/darling is mode $mode_4755, expected 4755: the .pkg.tar.zst would ship a non-setuid runtime"
 
 # --- 3. helpers ---------------------------------------------------------------------------------
 # kib_of_list FILE -- the installed size of the paths FILE names, in KiB, the unit stage.sh's
