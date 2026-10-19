@@ -121,7 +121,7 @@ order. It writes:
   including `SMBIOS_PROVISIONING_UDID`; unrelated legacy settings are not exported.
 - `System/Library/CoreServices/SystemVersion.plist`: an exact copy of the selected
   runtime's metadata, not a fabricated macOS release. The runtime root defaults
-  to the saved SDK path or `/usr/local/libexec/darling`; override with
+  to the saved SDK path or `/usr/libexec/darling`; override with
   `--runtime-root /path/to/runtime`.
 
 A valid runtime version file is required. The command checks all destinations
