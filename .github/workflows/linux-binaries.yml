@@ -717,7 +717,27 @@ jobs:
             export REFERENCE_DIFF_LINES
             REFERENCE_DIFF_LINES=$(wc -l < "$DARLING_PKG_DIST/pkg/prefix-diff.txt")
           fi
-          sh packaging/common/build-all.sh "$tag"
+          # build-all.sh hands the staging tree to the four format builders, and the tree is
+          # root-owned by now: scripts/build-packaging.sh installs the DESTDIR with sudo (it sets
+          # the setuid bit on usr/bin/darling), and part of the payload is unreadable BY DESIGN on
+          # top of that -- the CUPS backends usr/libexec/cups/backend/{ipp,lpd,dnssd} are mode
+          # 0700 (CUPS requires that), so an UNPRIVILEGED builder cannot even read them. Run
+          # 39218437320 (this step) measured it, quoting verbatim (path elided with '…'):
+          #   cp: cannot open '…/dist/pkg/root/./usr/libexec/darling/usr/libexec/cups/backend/ipp' for reading: Permission denied
+          #   cp: cannot open '…/…/cups/backend/lpd' for reading: Permission denied
+          #   cp: cannot open '…/…/cups/backend/dnssd' for reading: Permission denied
+          #   build-all: FATAL sh failed
+          # So the builders run with the privileges that created the tree, mirroring the T8
+          # launcher staging step above and the docker gates that verify these builders end-to-end
+          # AS ROOT (the local gates never saw this because they, too, run as root). Not chmod:
+          # that would rewrite the archived guest modes (0700 is the shipped shape). Not fakeroot:
+          # it intercepts ownership, it cannot READ root-owned 0700 files. build-all.sh now also
+          # pre-flights the tree's readability itself and fails closed naming the path, so the
+          # next privilege mismatch dies with the cause instead of `FATAL sh failed`.
+          # -E, not plain sudo: build-info.sh reads this run's provenance (COMMIT/REF/RUN/INPUTS/
+          # INPUT_TAG/REFERENCE_DIFF_LINES) from the environment, and sudo's env_reset would drop
+          # it back to build-info.sh's 'local'/'unknown' defaults.
+          sudo -E sh packaging/common/build-all.sh "$tag"
 
       # (PLAN §17.6, T11) `verify-packages.sh` installs every published format in a throwaway
       # container and asserts the result: G-VERIFY-1..5, the gate that makes the setuid,

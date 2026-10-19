@@ -58,6 +58,44 @@ case $1 in
 esac
 arg=$1
 
+# --- 0. pre-flight: CI provenance (probe (b); hoisted above dist/ on purpose) -------------------
+# Section 1..3 hands the tree to four builders that read it and copy it, and TWO things must be
+# true before they start; each is cheaper to learn here than halfway through a format. This one
+# comes first because it is the only probe that needs NO tree at all -- and it must fire before
+# `dist=${DARLING_PKG_DIST:-$repo/dist}` below resolves an empty DARLING_PKG_DIST into the
+# default tree: after that fallback the run would die on the default tree's missing staging
+# instead of at the boundary it just crossed. The readability sweep (a) follows, once dist/ has
+# a name.
+#
+# (b) CI PROVENANCE. The workflow's env: blocks supply this run's contract: COMMIT/REF/RUN (the
+# step's env:) and DARLING_PKG_DIST (the job's env: -- linux-binaries.yml pins it to
+# `${{ github.workspace }}/dist`, so this requirement cannot break the real CI call). The first
+# three go to BUILD-INFO-packages.txt (PLAN 12.3): without them build-info.sh falls back to
+# "local" / "unknown" -- correct defaults for a laptop, a silent provenance lie for a CI build.
+# DARLING_PKG_DIST is the variable that decides WHERE the four formats are written (dist=
+# below): without it the same fallback resolves $repo/dist and the run would silently build
+# from the default tree. Today the workflow's value COINCIDES with that fallback, and the
+# failure this probe exists for (plain sudo without -E, env_reset all-or-nothing) drops COMMIT
+# too -- so the DARLING_PKG_DIST half is hardening of the env: contract, not a live fix. The way
+# the environment gets lost is a plain sudo without -E (env_reset), i.e. exactly the privilege
+# boundary this step crosses, so the fatal names that remedy. Non-CI runs skip the check
+# entirely: local builds are supposed to say "local".
+if [ -n "${CI:-}" ]; then
+  _miss=
+  [ -n "${COMMIT:-}" ] || _miss="$_miss COMMIT"
+  [ -n "${REF:-}" ] || _miss="$_miss REF"
+  [ -n "${RUN:-}" ] || _miss="$_miss RUN"
+  [ -n "${DARLING_PKG_DIST:-}" ] || _miss="$_miss DARLING_PKG_DIST"
+  if [ -n "$_miss" ]; then
+    fatal "CI is set but the provenance environment is empty:$_miss
+  COMMIT/REF/RUN feed BUILD-INFO-packages.txt (PLAN 12.3): without them it records
+  build-info.sh's 'local'/'unknown' defaults instead of this run, and an empty DARLING_PKG_DIST
+  would silently build from this script's default dist instead of this run's. Either way the
+  environment did not survive the privilege boundary -- run this step with sudo -E (or sudo
+  --preserve-env=COMMIT,REF,RUN,DARLING_PKG_DIST)"
+  fi
+fi
+
 dist=${DARLING_PKG_DIST:-$repo/dist}
 case "$dist" in
   /*) : ;;
@@ -95,6 +133,53 @@ else
   Run scripts/build-packaging.sh (it needs x86-64) and then packaging/common/stage.sh, or use the
   'fixture' mode."
 fi
+
+# --- 0. pre-flight: read access, BEFORE the first builder ---------------------------------------
+# Section 1..3 hands the tree to four builders that read it and copy it, and this is the second
+# of the two checks that must pass before they start -- CI provenance (b) sits above dist= on
+# purpose, where it needs no tree (see there). It is cheaper to learn here than halfway through
+# a format.
+#
+# (a) READABILITY of the payload. scripts/build-packaging.sh installs the DESTDIR with sudo (it
+# sets the setuid bit on usr/bin/darling), so on CI $pkg/root is root-owned -- including guest
+# files that are mode 0700 BY DESIGN, the CUPS backends usr/libexec/cups/backend/{ipp,lpd,dnssd}.
+# An unprivileged copy of those dies with "cp: cannot open '…/ipp' for reading: Permission denied"
+# and run()'s wrapper buries it as "FATAL sh failed" ($1 = "sh"): run 39218437320 lost the real
+# cause that way. Fail closed HERE, naming the path and the remedy instead.
+#   - files AND directories, because a builder needs to read both.
+#   - NO symlink following (find's default -P mode, and the test is restricted to -type f/-type
+#     d): the tree carries usr/libexec/darling/Volumes/DarlingEmulatedDrive -> /, and a walk that
+#     follows it escapes the tree entirely (C19).
+#   - find's rc and stderr are captured SEPARATELY from its output (no pipe to hide the status):
+#     stderr non-empty means the sweep could not complete, and an incomplete sweep is fail-closed
+#     too -- a probe that cannot see the tree must not vouch for it.
+# Runs in BOTH modes. Fixture trees are small and user-owned, so the probe is a no-op there; and
+# as root every file reads, so a clean probe under sudo is the CORRECT reading, not a gap: the CI
+# shape IS root (mirroring the T8 launcher step and the docker gates that verify these builders
+# as root).
+if [ -d "$pkg/root" ]; then
+  _find_err=$(mktemp "${TMPDIR:-/tmp}/build-all-find-err.XXXXXX")
+  _frc=0
+  _unread=$(find "$pkg/root" \( -type f -o -type d \) ! -readable -print 2> "$_find_err") || _frc=$?
+  _ferr=$(cat "$_find_err" 2>/dev/null || true)
+  rm -f "$_find_err"
+  if [ -n "$_unread" ]; then
+    _n=$(printf '%s\n' "$_unread" | wc -l | tr -d ' ')
+    fatal "cannot read $_n entries under $pkg/root as uid $(id -u):
+$(printf '%s\n' "$_unread" | head -5 | sed 's/^/    /')
+  likely cause: the tree is root-owned after scripts/build-packaging.sh's sudo install (the
+  setuid bit on usr/bin/darling) -- check the listed paths' ownership; if the tree is yours, the
+  modes are the problem instead. Remedy: run this step with the privileges that created the tree
+  (CI: under sudo -E, like the T8 launcher staging step)"
+  fi
+  if [ "$_frc" -ne 0 ] || [ -n "$_ferr" ]; then
+    fatal "the readability sweep of $pkg/root did not complete (find rc=$_frc):
+$(printf '%s\n' "$_ferr" | head -5 | sed 's/^/    /')
+  fail closed rather than hand a tree it could not read to the builders: fix the sweep's
+  environment, or run this step with the privileges that created the tree (CI: under sudo -E)"
+  fi
+fi
+
 for f in files.all files.runtime files.launcher; do
   # In fixture mode the first builder stages the tree; in production the T1 contract says stage.sh
   # already ran, so a missing list is a broken pipeline rather than something to paper over.
