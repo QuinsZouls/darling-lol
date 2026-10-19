@@ -272,7 +272,7 @@ def main(argv=None):
     parser.add_argument('--import', dest='source', type=Path, help='OpenCore plist, GenSMBIOS JSON, legacy .conf, or schema-1 plist/JSON')
     parser.add_argument('--set', action='append', default=[], metavar='KEY=VALUE')
     parser.add_argument('--provision', action='store_true', help='Generate missing synthetic identifiers and provision prefix metadata')
-    parser.add_argument('--runtime-root', type=Path, help='Runtime supplying SystemVersion.plist (default: saved SDK or /usr/local/libexec/darling)')
+    parser.add_argument('--runtime-root', type=Path, help='Runtime supplying SystemVersion.plist (default: saved SDK or /usr/libexec/darling)')
     parser.add_argument('--rom-oui', help='Explicit three-byte unicast OUI for a missing ROM; default is locally administered')
     parser.add_argument('--write', action='store_true', help='Write validated overrides to a stopped prefix (otherwise preview only)')
     args = parser.parse_args(argv)
@@ -316,7 +316,7 @@ def main(argv=None):
                     properties.pop('provisioning_UDID', None)
                 if key == 'model': properties.pop('product-name', None)
                 properties[key] = value
-            runtime_root = args.runtime_root or Path(saved.get('sdk', '/usr/local/libexec/darling'))
+            runtime_root = args.runtime_root or Path(saved.get('sdk', '/usr/libexec/darling'))
             if args.provision:
                 properties = provision(properties, rom_oui)
                 provisioning_files(prefix, properties, runtime_root)

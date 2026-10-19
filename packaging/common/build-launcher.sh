@@ -11,7 +11,7 @@
 # the three builders in fixture mode build their roots with a *stub* launcher tree of 8 paths
 # and assert exact counts over it; copying 200+ files inside stage.sh would turn those rows
 # red, and guarding the copy ("only if the tree is absent") is a branch that silently skips
-# the one thing it exists to do. The losing cost is two invariants plus a 73/0 battery.
+# the one thing it exists to do. The losing cost is two invariants plus a 74/0 battery.
 #
 # The manifest (what it writes):
 #   usr/bin/darling-lol                           <- packaging/install/darling-lol.in, with the
@@ -97,6 +97,14 @@ install -m 0755 "$tmp" "$root/usr/bin/darling-lol" || stage_fail
 install -m 0755 "$repo/scripts/configure.py" "$repo/scripts/common.py" \
   "$root/usr/lib/darling-lol/scripts/" || stage_fail
 cp -a "$repo/tools/." "$root/usr/lib/darling-lol/tools/" || stage_fail
+# Python build byproducts never ship: tools/**/__pycache__/*.pyc are gitignored output of the
+# repo's own test command, and BOTH content sweeps skip binaries by design (check-prefix.sh greps
+# with -InH, launch-harness.sh with -Il), so a stale cache compiled from pre-fix source could
+# carry /usr/local/libexec/darling past G-PREFIX-1 while it prints PREFIX: OK. Strip them from
+# the STAGED tree right after the copy (the checkout's own tools/ stays untouched); section 4
+# below fails closed on the result, so a byproduct from any other source dies loudly too.
+find "$root/usr/lib/darling-lol/tools" -type d -name __pycache__ -prune -exec rm -rf {} + || stage_fail
+find "$root/usr/lib/darling-lol/tools" -type f \( -name '*.pyc' -o -name '*.pyo' \) -exec rm -f {} + || stage_fail
 install -m 0644 "$readme" "$root/usr/share/doc/darling-lol/README-packaging.md" || stage_fail
 
 # 4. Fail closed on the result. stage.sh step 4's guard is `[ -e "$root/$p" ] && ...`, which
@@ -108,6 +116,21 @@ for p in usr/bin/darling-lol usr/lib/darling-lol/scripts/configure.py \
   [ -e "$root/$p" ] || die "payload missing after staging: $root/$p"
 done
 [ -x "$root/usr/bin/darling-lol" ] || die "$root/usr/bin/darling-lol is not executable"
+# The staged payload must carry NO Python build byproducts, asserted fail-closed on the whole
+# usr/lib/darling-lol tree (not just the tools/ copy above): __pycache__/*.pyc/*.pyo are
+# gitignored build output, not payload, and the content sweeps CANNOT see them -- both skip
+# binaries by design (check-prefix.sh greps with -InH, launch-harness.sh with -Il) -- so a stale
+# cache compiled from pre-fix source could ship the forbidden /usr/local/libexec/darling literal
+# while G-PREFIX-1 prints PREFIX: OK. Offenders are listed first, same style as the /home/runner
+# check below.
+byp=$(find "$root/usr/lib/darling-lol" \
+        \( -type d -name __pycache__ \) -o \
+        \( -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
+        | LC_ALL=C sort)
+if [ -n "$byp" ]; then
+  printf '%s\n' "$byp" | head -5 >&2
+  die "the staged payload carries Python build byproducts (listed above): __pycache__/*.pyc/*.pyo are build output that the content sweeps cannot see because they skip binaries (check-prefix.sh -InH, launch-harness.sh -Il), so a stale cache could ship a forbidden literal past G-PREFIX-1"
+fi
 
 # 5. Two properties of the shipped payload, asserted count-agnostically. Never assert a file
 #    count here: tools/ holds 212 top-level files plus 14 in subdirectories on this commit (226 in
