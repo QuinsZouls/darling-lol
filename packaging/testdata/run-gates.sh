@@ -28,8 +28,8 @@
 # therefore no expectation to violate: a skip is REPORTED, never turned into a failure, and rc stays
 # 0. (Contrast run-deb-gates.sh, where the docker row's input IS expected in CI and T3_GATES_REQUIRE_
 # DOCKER exists to force it; nothing here has a comparable expectation.) The counter is a real
-# counter, not a constant: with T1_PLAN_FILE set the same battery prints `73 passed, 0 failed, 0
-# skipped`, with it unset `72 passed, 0 failed, 1 skipped`.
+# counter, not a constant: with T1_PLAN_FILE set the same battery prints `74 passed, 0 failed, 0
+# skipped`, with it unset `73 passed, 0 failed, 1 skipped`.
 #
 # 🚨 `skip()` here is NOT launch-harness.sh's `skip()` (review MINOR-2). That one is a PRECONDITION
 # guard: it exits 77 without ever painting a row. This one PAINTS a counted SKIP row in the body and
@@ -258,6 +258,41 @@ chk "same fixture, 2 runs: sha256 of files.* + count.* identical" \
 rm -rf "$WORK/det3" && bash packaging/testdata/mkfixture.sh "$WORK/det3" >/dev/null
 sh packaging/common/stage.sh "$WORK/det3/root" "$WORK/det3/out" >/dev/null
 chk "two independently built fixtures: the 8 artifacts are byte-identical" "$(diff -r "$WORK/fix/out" "$WORK/det3/out" | wc -l)" 0
+
+# --- build-launcher.sh: the staged payload ships no Python build byproducts (review MAJOR) -----
+# The launcher payload's tools/ half is a VERBATIM cp -a of the checkout's tools/, so a gitignored
+# test-run byproduct (tools/**/__pycache__/*.pyc) used to be staged, listed by stage.sh and shipped
+# -- while BOTH content sweeps skip binaries by design (check-prefix.sh greps with -InH,
+# launch-harness.sh with -Il), so a stale cache compiled from pre-fix source could carry the
+# forbidden /usr/local/libexec/darling literal past G-PREFIX-1 printing PREFIX: OK. No pre-existing
+# row here runs build-launcher.sh, and extending G-STATIC-6's fixture was NOT the home for this:
+# a __pycache__ under its launcher half moves the pinned `files.launcher owns usr/lib/darling-lol
+# == 6` row. So this row builds its own scratch checkout instead: build-launcher resolves every
+# source relative to its own location ($0/../..), and a copy of the tree under test is where the
+# byproduct gets planted -- never the real tools/.
+sec "G-LAUNCH-2  build-launcher.sh: the staged payload ships no Python build byproducts"
+blfix=$WORK/bl
+mkdir -p "$blfix/packaging/common" "$blfix/packaging/install" "$blfix/scripts"
+cp packaging/common/build-launcher.sh "$blfix/packaging/common/"
+cp packaging/install/darling-lol.in packaging/install/README-packaging.md.in "$blfix/packaging/install/"
+cp scripts/configure.py scripts/common.py "$blfix/scripts/"
+cp -a tools "$blfix/tools"
+# The planted stale cache: byproduct content (NUL-leading, like real bytecode, so a text sweep
+# skips it) carrying the old literal. The row is green only if the fixture really held it, the
+# build succeeded, and NOTHING of it reached the staged tree.
+mkdir -p "$blfix/tools/__pycache__"
+printf '\000# stale cache of the pre-fix source\nfallback = "/usr/local/libexec/darling"\n' \
+  > "$blfix/tools/__pycache__/stale.cpython-311.pyc"
+have=0
+if [ -f "$blfix/tools/__pycache__/stale.cpython-311.pyc" ] \
+   && grep -qF '/usr/local/libexec/darling' "$blfix/tools/__pycache__/stale.cpython-311.pyc"; then have=1; fi
+blrc=0; sh "$blfix/packaging/common/build-launcher.sh" "$WORK/blroot" >"$WORK/bl.log" 2>&1 || blrc=$?
+[ "$blrc" = 0 ] || sed 's/^/    /' "$WORK/bl.log"
+blleft=$(find "$WORK/blroot/usr/lib/darling-lol" \
+           \( -type d -name __pycache__ \) -o \
+           \( -type f \( -name '*.pyc' -o -name '*.pyo' \) \) 2>/dev/null | wc -l | tr -d ' ')
+chk "the planted stale cache is held (1), staging exits 0 (0), zero __pycache__/pyc/pyo staged (0)" \
+  "$have $blrc $blleft" "1 0 0"
 
 sec "G-PREFIX-1  check-prefix.sh: the positive run"
 rm -rf "$WORK/pfx" && bash packaging/testdata/mkprefixfixture.sh "$WORK/pfx" >/dev/null
