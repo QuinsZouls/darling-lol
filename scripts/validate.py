@@ -3,6 +3,7 @@
 import ast,json,re,subprocess,sys
 from pathlib import Path
 from common import ROOT
+import patchcheck
 subprocess.run([sys.executable,str(ROOT/'scripts/configure.py')],check=True)
 try:
     files=subprocess.check_output(['git','-C',str(ROOT),'ls-files','-z'],stderr=subprocess.DEVNULL).decode().split('\0')
@@ -38,6 +39,9 @@ for c in manifest['components']:
         parsed=subprocess.run(['git','apply','--numstat','-'],input=(ROOT/c['patch']).read_text(),
                               text=True,capture_output=True)
         if parsed.returncode:errors.append(c['patch']+': '+parsed.stderr.strip())
+        # A patch that applies but adds a block twice only fails at compile time (run #66).
+        for finding in patchcheck.duplicate_blocks((ROOT/c['patch']).read_text()):
+            errors.append(c['patch']+': '+patchcheck.describe(finding))
 if errors:
     print('\n'.join(errors));raise SystemExit(1)
 print('PASS: tracked source audit, rendered Python/shell syntax and',len(manifest['components']),'pinned patch entries')
