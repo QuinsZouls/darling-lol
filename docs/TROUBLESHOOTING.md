@@ -1,5 +1,23 @@
 # Troubleshooting
 
+## NixOS launcher fails before Riot opens
+
+A message saying Darling must be setuid root is not fixed by running `sudo`
+inside `buildFHSEnv`: bubblewrap enables `no_new_privs`, so setuid elevation is
+ignored there. Use the package's rootless launcher with subordinate UID/GID
+mapping enabled. Never make a mutable workspace executable host-setuid-root.
+
+If a newly installed client aborts with `Cannot load libavformat.so.62 (ELF)`,
+check the FHS runtime dependencies. The generated Darling wrappers use FFmpeg 8
+SONAMEs, so an unversioned nixpkgs `ffmpeg` dependency can break them when its
+major changes. The package pins `ffmpeg_8`; do not create fake ABI symlinks.
+
+Older packages used `cp -n` and never refreshed already-copied tools. The current
+launcher replaces packaged source files while retaining compiled/runtime data.
+An incomplete prefix can be backed up by renaming it with Darling stopped;
+never delete a populated Riot/game prefix just to repair the launcher.
+
+
 Use the [setup instructions](SETUP.md) from the repository root as your ordinary user. Exit the game and both clients manually before a full installation or Darling restart. Incremental server/memory installers can replace files without interrupting processes, but their changes need a later full restart to activate.
 
 ## Memory installer: permission denied
@@ -38,6 +56,34 @@ The observed proportional resident footprint was roughly 4.3 GiB across Riot, Le
 The old kernel library returned success for Darwin allocator free/reuse hints without making any pages reclaimable. The replacement maps free/reusable hints to Linux `MADV_FREE`, and reuse to `MADV_POPULATE_WRITE`. The standalone 4 MiB buffer becomes reclaimable and returns to normal on reuse while preserving surviving data. This fixes a demonstrated runtime behavior, but does not explain all client allocations or prove a specific RAM reduction. Linux may retain lazily reclaimable pages in RSS while RAM is available. A five-minute idle observation did not show rapid client memory growth.
 
 Build/install the kernel library using [the incremental update steps](SETUP.md#updating-an-existing-runtime), then perform the manual restart when finished playing. Linux 5.14+ is required. Do not kill client helpers as an attempted memory optimization during play.
+
+## Shaders are recompiled on every start
+
+Mesa resolves its shader disk cache below `$HOME`. Inside the guest, `$HOME` is
+`/Users/<user>`, which does not exist on the host filesystem, so Mesa cannot create the
+cache and disables it, once per process:
+
+```
+Failed to create /Users/<user> for shader cache (Permission denied)---disabling
+```
+
+One launcher log without the fix contained 212 of these lines, and no shader compiled by
+one process was reused by another process or by the next start: the client and the game
+recompiled every shader, on every launch. Mesa is host code loaded into the guest and
+reads `MESA_SHADER_CACHE_DIR` verbatim, so the launcher now passes a host directory:
+
+```sh
+MESA_SHADER_CACHE_DIR=${XDG_CACHE_HOME:-${HOME:-$prefix_dir}/.cache}/darling-lol   # launcher default
+```
+
+Mesa creates `mesa_shader_cache/` (client and game shaders) and `radv_builtin_shaders/`
+below it. With the change, one client start logged no shader-cache failure and wrote 434
+files / 5.6 MB, still growing while the client ran (Radeon RX 550, radv). Set
+`MESA_SHADER_CACHE_DIR` yourself to move the cache, for example to another disk: the
+launcher preserves a non-empty value, and a directory that cannot be created leaves the
+previous behaviour. Reusing the cache removes the repeated compilation; the startup-time
+gain has not been measured separately. Cache entries are keyed by driver and GPU, so a
+driver update recompiles once and caches again.
 
 ## Installer exits, cannot write temporary files, or Install appears idle
 
@@ -103,6 +149,168 @@ ownership or window information cannot be read. A hidden background client or
 download is restarted when recovery is enabled. Other desktop environments are
 not supported by this helper; recovery is off by default.
 
+For a live Darling runtime with no visible client window but stale Riot/League/
+CEF processes at least 60 seconds old, `RCLOL_RECOVER_STALE_CLIENT=1` performs a
+partial recovery before the next launch. It keeps `darlingserver`, launchd/mldr,
+sockets and `.init.pid`, stops only the stale client process tree, and then lets
+the normal launcher start the product again. It recognizes `LeagueClientUx`,
+`Riot Client` and `RiotClientServices` windows, does nothing while a game process
+is running or when a managed client window is visible, and fails closed when
+X11/Xwayland properties are missing or unreadable. This saves the Darling
+bootstrap but not the Riot Client/CEF startup itself. The stale tree is signalled
+deepest-first so live parents can still reap their own children. Guest launchd
+periodically reaps untracked orphaned zombie children. Recovery reports the PID,
+state and parent of each process still present after SIGKILL; a surviving live
+process or a zombie owned by another parent may require further investigation.
+If processes remain or no window appears afterward, use a full runtime
+shutdown/restart.
+
+### Multiple client-in-game helpers
+
+The close/hide helper is a long-lived watcher. If an earlier launcher exits
+while it remains, the next launch can start another copy; list them with:
+
+```sh
+pgrep -af 'close-league-client-in-game.py|hide-league-client-in-game.py'
+```
+
+To remove the orphaned copies before the next helper starts:
+
+```sh
+RCLOL_CLEAN_STALE_HELPERS=1 ./scripts/run.sh
+```
+
+Only helpers of the current prefix whose parent is `init`/`systemd` are
+terminated. Helpers whose launcher is still alive, other prefixes, the game,
+Riot/League/CEF, `darlingserver` and the runtime are never touched. A dry run
+is available from the configured tools directory:
+
+```sh
+RCLOL_CLEAN_STALE_HELPERS=1 python3 build/runtime/tools/clean-stale-helpers.py --dry-run
+```
+
+### Client window stays black after a match
+
+The League client keeps its Chromium/CEF UI (`LeagueClientUx` and its helpers)
+alive during a match. Riot's own "Close client during game" option closes that UI
+on Windows, but under Darling the pre-match instance keeps running: the client the
+backend starts when the match ends is a second CEF instance on the same
+`--user-data-dir`, and its window never paints. Its DOM and audio work and the
+window stays black. Closing the client by hand during the match leaves the same
+state for the same reason.
+
+An opt-in helper closes that UI itself, from the host, and only while a match
+runs, so the client that appears afterwards is the only instance:
+
+```sh
+RCLOL_CLOSE_CLIENT_IN_GAME=1 ./scripts/run.sh
+```
+
+This is not a memory measure: the UI is closed because it competes with the game
+for CPU during the match. Measured on a four-core host with a Radeon RX 550, a
+practice match reported roughly 120 FPS with the client UI running and roughly
+180 FPS with it closed. On that host a local supervisor using the same detection
+closed 13 client processes (2027 MiB resident) when a practice match started, and
+the client came back as one instance with a painted window when it ended; the
+helper described here has not been through a live match yet. Riot's own option is
+the equivalent on Windows, so leave either one disabled if the in-client chat is
+wanted during a match.
+
+The helper is off by default and fails closed: it attributes both the game and the
+client to the launcher's prefix through the loader's `__mldr_sockpath` (guest
+processes do not carry `DPREFIX`), never closes a client younger than 60 seconds
+(the one the backend starts after a match), leaves the Riot client, the League
+backend and the game untouched, and takes no action when ownership, the
+environment or the stat fields cannot be read. The client UI is recognised by the
+name of its executable, not by the command line: `LeagueCrashHandler` processes
+carry the client UI name in their arguments only, so they are left alone. It
+leaves by itself ten minutes after the last client or match is gone (the clock does
+not run before the first client appears, so a long patch or login is fine). Diagnose it in one
+observation, without waiting for a match:
+
+```sh
+python3 tools/close-league-client-in-game.py --once --dry-run
+```
+
+### Automatic client handling during a match
+
+A single opt-in switch reads the client's own preferences and chooses the mode:
+
+```sh
+RCLOL_CLIENT_IN_GAME_TRICKS=1 ./scripts/run.sh
+```
+
+It reads `lol-user-experience` from the installed client's
+`LCULocalPreferences.yaml`:
+
+| Client preference | Launcher action |
+|---|---|
+| `potatoModeEnabled: false` or unreadable | no client-in-game helper |
+| `potatoModeEnabled: true`, close preference missing or invalid | no action |
+| `potatoModeEnabled: true`, `closeLeagueClientDuringGame: true` | close the client UI |
+| `potatoModeEnabled: true`, `closeLeagueClientDuringGame: false` | hide the client windows |
+
+The hide path unmaps the `LeagueClientUx` and `Riot Client` X11 windows and maps
+them again when the game process ends. The client is not closed, the League
+backend and Riot client keep running, and the game window is never hidden. The
+close path uses the UI-close helper described above. The hide helper exits after
+ten minutes without a client or match once it has seen one; a missing or invalid
+close preference selects no helper.
+
+The low-level `RCLOL_HIDE_CLIENT_IN_GAME=1` and
+`RCLOL_CLOSE_CLIENT_IN_GAME=1` switches remain available when the automatic
+switch is not set. All modes are off by default. The helpers are
+window-management only: they do not patch client binaries, CEF, anti-cheat or
+DRM. They attribute the game to this prefix through the loader's
+`__mldr_sockpath`, and fail closed when ownership, proc state, environment or
+window information cannot be read. The hide helper requires an X11 or Xwayland
+desktop; on a native Wayland window manager without Xwayland it cannot find the
+windows.
+
+On a CPU-bound host the hide effect appears after CEF has been hidden for a few
+seconds. In a local 30-second test on an i5-3470 with a Radeon RX 550, hiding
+`LeagueClientUx` reduced the summed CPU of the matched client/CEF processes from
+120.7% to 93.4% (about 23%, or 27 percentage points, of one core); showing the
+window returned it to 119.9%. This is not a universal FPS or percentage claim:
+a game that is GPU-bound, a client with no active UI work, or a different
+desktop may show less benefit. The hidden window can also need a moment to
+repaint after it is shown.
+
+With client optimizations enabled and close-during-game enabled, the close
+helper remains the more aggressive option when in-client chat during the match
+is not needed.
+
+Diagnose the match detector without changing any window:
+
+```sh
+python3 tools/hide-league-client-in-game.py --once
+```
+
+### Riot reports NO INTERNET FOUND while the host is online
+
+Older base runtimes ship Google DNS servers (`8.8.8.8` and `8.8.4.4`), which
+some mobile and managed networks block. The base resolver now links to the
+host's `/etc/resolv.conf` through `/Volumes/SystemRoot`, including when the host
+file is a symlink into `/run` for systemd-resolved or NetworkManager. File and
+symlink replacements remain visible without copying the resolver on launch.
+
+Exit Riot and League, then run `./scripts/update.sh` to rebuild and install both
+the base link and the host symlink handling correction. Existing prefix DNS
+overrides in `$DPREFIX/private/etc/resolv.conf` (normally
+`~/.darling/private/etc/resolv.conf`) remain in effect; remove a previous manual
+override with Darling stopped if you want to follow the host instead. A custom
+prefix `/etc` directory can also shadow the base `/etc -> private/etc` link.
+
+Check resolution inside the guest with:
+
+```sh
+darling shell curl --noproxy '*' https://clientconfig.rpg.riotgames.com/
+```
+
+An HTTP response establishes that resolution succeeded even if that endpoint
+rejects the request. This change follows the host resolver configuration;
+already-running clients may cache DNS settings until restarted.
+
 ### Downloads repeatedly fail with an IPv6 CONNECT_TO error
 
 The bundled downloader was observed retrying CDN chunks with:
@@ -123,18 +331,6 @@ RCLOL_CDN_IPV4_ONLY=0 ./scripts/run.sh
 The resolver change requires a rebuilt/installed base runtime. The environment
 flag alone cannot alter an older Libinfo binary.
 
-## `Unable to read system root certificates` or `Error -25263`
-
-Riot logs `CertBundle: Unable to read system root certificates` and Chromium logs `[known_roots_mac.cc(60)] Unable to determine trusted roots; assuming all roots are trusted! Error -25263` when the prefix has no system trust domain. Security reads that domain from `/System/Library/Keychains/SystemRootCertificates.keychain` and `SystemTrustSettings.plist`, which Darling does not ship, so `SecTrustSettingsCopyCertificates` returns `errSecNoTrustSettings`.
-
-`tools/ensure-darling-root-certificates.py` builds both from the host CA bundle (`/etc/ssl/cert.pem` or whichever bundle Python's `ssl` reports; `--bundle` overrides it). The launcher and `scripts/install-runtime.sh` run it. Each self-signed root gets an unrestricted trust entry. The keychain is built with the guest `security` tool in a single `darling shell`. A stamp in the same directory records the bundle's digest, so later launches skip it without starting Darling until the host bundle changes. If Darling was already running and the guest could not write the directory, the script installs the files on the host and says they apply after `darling shutdown`. A failure prints `Darling system root certificates were not installed: …` and the launch continues. To rebuild by hand:
-
-```sh
-python3 build/runtime/tools/ensure-darling-root-certificates.py --force
-```
-
-`python3 -m unittest tests.test_root_certificates` compares the generated SHA-1 keys, issuer names and serial numbers with OpenSSL, and checks that an unchanged bundle is skipped. It uses stub `darling` and `security` commands. Reading the keychain and the system trust domain inside a real guest (`security find-certificate -a /System/Library/Keychains/SystemRootCertificates.keychain`, `security dump-trust-settings -s`) is not yet confirmed.
-
 ## Riot closes after a network lookup is cancelled
 
 Two local crashes were traced to `CFNetwork::_HostCancel` calling `CFRetain(NULL)`.
@@ -149,11 +345,38 @@ reference before callback delivery. This establishes the cancellation fix; a lon
 Riot session still needs confirmation. With both clients and the game closed,
 run `./scripts/update.sh` to install it, then `sh scripts/run.sh`.
 
+## League and Riot UIs crash after clicking Play
+
+The League UX processes and then the Riot Client renderer stop with `SIGTRAP`
+a few seconds after the lobby opens. The renderer prints
+`Check failed: kr == KERN_SUCCESS. mach_make_memory_entry_64: (os/kern) resource shortage (6)`
+from `platform_shared_memory_region_mac.cc`. darlingserver backs every named
+memory entry with a memfd, and its open descriptors peak at about 1100 when the
+lobby opens. Under the rootless NixOS launcher darlingserver cannot raise its
+hard `RLIMIT_NOFILE` to `nr_open`, so it used to keep the soft limit it
+inherited. When that limit was 1024 (several Electron apps and desktop launchers
+pass it on), `memfd_create` failed with `EMFILE`.
+
+darlingserver now raises its soft limit to the inherited hard limit when it
+cannot raise the hard one. A failed named-entry creation also logs
+`MEMDIAG … failed errno=… nofile=soft/hard` to `dserver.log`, and every 1024th
+memfd logs `MEMDIAG descriptors live=…` so a leak would show as a growing `live`
+count. With a 1024 soft limit the old server reproduced the crash and logged
+`errno=24 nofile=1024/524288`. With the fix, the server reports a 524288 soft
+limit under the same launch. To check a running server, read the `Max open files`
+line of `/proc/$(pgrep -x darlingserver)/limits`.
+
 ## UI crashes after a button opens an external link
 
 LaunchServices dereferenced a nullable error-output pointer in six paths. The patch checks the pointer itself and populates supplied outputs; the standalone regression covers missing handlers and null outputs. Electron opens LaunchServices through an absolute CoreServices subframework path, so the paired installer also replaces that binary in the stopped guest prefix. Updating only `RuntimeFrameworks/LaunchServices.framework` can leave the crash unfixed.
 
 LaunchServices now opens `http`, `https` and `mailto` links on the Linux desktop itself. It loads the host's `libsystemd.so.0` and asks `xdg-desktop-portal` (`org.freedesktop.portal.OpenURI`) on the user session bus to open the link, so your default browser starts outside Darling and survives `darling shutdown`. Without a portal, it starts `xdg-open` in a transient systemd user unit instead. It also reports a handler for these schemes, since Electron checks for one before opening a link. Other schemes, control characters and URLs over 4096 bytes are rejected. If a link still does nothing, check the client's stderr for a `LaunchServices:` line and that `busctl --user status org.freedesktop.portal.Desktop` works on the host. Both LaunchServices and AppKit must be rebuilt. The hand-off passed the host-side D-Bus regression and opened the host browser from a guest through both `open(1)` and `NSWorkspace`; a link clicked in the Riot client is not yet confirmed. The null-pointer fix does not explain every unrelated button crash.
+
+## Riot client shows "Not Found" instead of its UI
+
+On affected setups, including the reported NixOS installation, the client window opens but only shows `Not Found`, and its log has `ENOENT, dist/renderer/index.html not found in …/app.asar` although the archive contains that file. Electron's asynchronous file opening can copy an archive entry to a temporary file first (`copyFileOut`), and a failed copy can be reported as "not found". Chromium checks `MAC_CHROMIUM_TMPDIR` before falling back to `NSTemporaryDirectory()`; an unusable default temporary directory can therefore produce this symptom even while synchronous archive reads work.
+
+The launcher defaults `MAC_CHROMIUM_TMPDIR` to `/private/tmp`, preserving a non-empty override. `scripts/install-runtime.sh` creates that guest directory with mode `1777`. Verify directory creation and temporary-file writes with a standalone guest probe, then launch the client normally and check whether its UI loads. Do not run diagnostic scripts through Riot's executable. This workaround addresses temporary-file failures; an actually missing or damaged archive needs separate investigation.
 
 ## Language dropdown closes Riot, or client resize leaves a clipped UI
 
@@ -247,7 +470,7 @@ It prints each thread-local access that calls its thunk without the descriptor i
 
 ## Base install refuses to continue while Darling is not running
 
-`sudo cmake --install` prints `Darling currently running for <user>, shutting it down...` several times and then `Darling launchd PID … remains alive after shutdown`. A guest launchd outlived its darlingserver, so `darling shutdown` sees no container to stop. `python3 build/runtime/tools/ensure-darling-runtime.py` stops such a launchd (your own, only when no darlingserver runs); `scripts/run.sh` and `scripts/install-runtime.sh` run it too.
+`sudo cmake --install` prints `Darling currently running for <user>, shutting it down...` several times and then `Darling launchd PID … remains alive after shutdown`. A guest launchd outlived its darlingserver, so `darling shutdown` sees no container to stop. Automatic cleanup by process name is disabled because guest names and UIDs do not prove prefix ownership (killing by name risks terminating an active launchd from an unrelated prefix or session). If setup is blocked, shut down the original Darling session from its own namespace (`darling shutdown`), or inspect the leftover PID under `/proc/<PID>` before terminating it manually.
 
 ## Lower fight FPS than Windows
 
@@ -263,10 +486,78 @@ Compare matches on the same map: Bilgewater runs a few percent below Hexgate.
 
 On Hyprland, also check that direct scanout is off (`hyprctl getoption render:direct_scanout` prints `int: 0`). The first match with it off ran about 16 FPS faster than the previous one on the same build; see the next section.
 
+On the NVIDIA proprietary driver, check the submit worker's kernel time: a thread of the game process spending most of its time in the kernel (`/proc/<pid>/task/<tid>/stat` system time, or `perf trace -s -p <pid>`) points at driver calls. Each `vkQueueSubmit2` and each CPU-side `vkSignalSemaphore` is an RM control ioctl (command `0xc020462a`) that queues on a driver-wide lock. Before 2026-10-18 every command buffer signalled the event loop's wake-up semaphore, ~25 times per frame; with lazy wake-ups (default) and a 5 ms batch window (`/tmp/metal-submit-batch-us` = `5000`, `/tmp/metal-submit-batch-max` = `64`) an RTX 4090 ran at 206–552 FPS against 91–147 FPS with `/tmp/metal-no-lazy-wakeup`, in alternating 20 s phases of one match (the later phases with wake-ups on were capped at 240 FPS) (see [setup](SETUP.md#metal-and-indium-overlays)).
+
+The NVIDIA performance figures above were reported on an earlier runtime base;
+they have not been remeasured after integration with current `main`. On `bcb3245` an RTX 5060 Laptop reported ~200–215 FPS in Practice Tool ([#53](https://github.com/lucannez64/darling-lol/issues/53)).
+
+## NVIDIA
+
+With the window visual and compositor draw buffer fixes (#22) and the RPC socket fix (#25), the game renders and runs on these NVIDIA GPUs:
+
+| GPU | Driver | Report | Result |
+|---|---|---|---|
+| GTX 1060 6GB | 580.178.04 | [below](#nvidia-580-pascal-and-older-black-game-window) | client and tutorial |
+| RTX 2070 SUPER | 615.78, proprietary | [#55](https://github.com/lucannez64/darling-lol/issues/55) | tutorials, Co-op vs AI, Swiftplay and Draft games; no crashes |
+| RTX 3060 | 615.71 | [below](#nvidia-resize-signals-cpu-readback-and-completion-latency) | custom matches through CPU readback |
+| RTX 5060 Laptop | 615.71.09, open modules | [#53](https://github.com/lucannez64/darling-lol/issues/53) | Practice Tool at ~200–215 FPS on `bcb3245`; MUX set to discrete, PRIME variables set |
+| RTX 5070 | 615.78.08, open modules | [#69](https://github.com/lucannez64/darling-lol/issues/69) | tutorial |
+
+If the game window stays black on NVIDIA, check `metal-device.log` as described in [Check which GPU rendered](#check-which-gpu-rendered).
+
+## Vulkan device or ICD selection
+
+The Metal wrapper renders with Vulkan and hands each frame to an OpenGL (EGL)
+context. If the machine has more than one Vulkan ICD, or a software Vulkan
+device such as lavapipe, the loader can enumerate a device that does not match
+the presenting GPU. The client may then stop with a Metal device or version
+error even though the runtime built correctly ([#127](https://github.com/lucannez64/darling-lol/issues/127)).
+
+Check what the loader reports and what Metal selected:
+
+```sh
+ls -l /usr/share/vulkan/icd.d/
+vulkaninfo --summary
+```
+
+The device log is opt-in and append-only. With the game and both clients closed,
+clear the old log and enable logging for one reproduction:
+
+```sh
+rm -f "${DPREFIX:-$HOME/.darling}/private/tmp/metal-device.log"
+DARLING_METAL_DEVICE_LOG=1 sh scripts/run.sh
+```
+
+After reproducing, inspect the `physical`, `selected` and `presenting` lines
+for the same process ID:
+
+```sh
+grep -E 'physical name|selected name|presenting GL' "${DPREFIX:-$HOME/.darling}/private/tmp/metal-device.log"
+```
+
+If the selected device is wrong, restrict Vulkan to the intended driver's ICD:
+
+```sh
+DARLING_METAL_DEVICE_LOG=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json sh scripts/run.sh
+```
+
+The filename is distribution and driver specific (`radeon_icd.x86_64.json`,
+`nvidia_icd.json` and `intel_icd.x86_64.json` are common). Choose the JSON for
+the GPU you want, and set this per launch; do not install it globally in a shell
+profile. `VK_ICD_FILENAMES` changes the Vulkan side only. If the log reports
+`MISMATCH`, the presenting OpenGL context is on another GPU; use the PRIME or
+EGL variables in [hybrid graphics](#hybrid-graphics-laptops-amdintel-igpu--nvidia)
+as well. If `physical name` shows `llvmpipe` or another CPU device, select the
+hardware ICD or enable [`/tmp/metal-skip-cpu-devices`](SETUP.md#metal-and-indium-overlays).
+
+This workaround selects an ICD/driver, which can expose several physical GPUs.
+It does not guarantee a particular GPU or a match with the OpenGL presenting
+GPU, and it does not make unsupported Metal features available. Include the `physical`, `selected` and `presenting` lines from
+`metal-device.log` when reporting the failure.
+
 ## Hybrid graphics laptops (AMD/Intel iGPU + NVIDIA)
 
-Metal renders with Vulkan, and each finished frame is handed to an OpenGL (EGL) context that presents it. The hand-off uses opaque file descriptors, which only work when Vulkan and OpenGL run on the same GPU. Indium takes the first Vulkan device the loader lists, and on a hybrid laptop both that device and the EGL context are normally the integrated GPU, so the discrete GPU stays idle. A report in [issue #3](https://github.com/lucannez64/darling-lol/issues/3) (Ryzen 9 5900HS, RTX 3060 Laptop) measured 60-70 FPS in ARAM on the integrated GPU; on the NVIDIA GPU the game showed a black screen. On a single-GPU NVIDIA desktop the game now runs; see [NVIDIA proprietary driver](#nvidia-proprietary-driver) for what changed and what is still limited.
-
+Metal renders with Vulkan, and each finished frame is handed to an OpenGL (EGL) context that presents it. The hand-off uses opaque file descriptors, which only work when Vulkan and OpenGL run on the same GPU. Indium takes the first Vulkan device the loader lists, and on a hybrid laptop both that device and the EGL context are normally the integrated GPU, so the discrete GPU stays idle. A report in [issue #3](https://github.com/lucannez64/darling-lol/issues/3) (Ryzen 9 5900HS, RTX 3060 Laptop) measured 60-70 FPS in ARAM on the integrated GPU; on the NVIDIA GPU the game showed a black screen, since fixed (see [NVIDIA](#nvidia)).
 ### Run on the discrete GPU
 
 Start the launcher with PRIME render offload so that both Vulkan and OpenGL move to the NVIDIA GPU:
@@ -275,13 +566,18 @@ Start the launcher with PRIME render offload so that both Vulkan and OpenGL move
 prime-run sh scripts/run.sh
 ```
 
-`prime-run` sets `__NV_PRIME_RENDER_OFFLOAD=1`, `__VK_LAYER_NV_optimus=NVIDIA_only` and `__GLX_VENDOR_LIBRARY_NAME=nvidia`. `darling` copies the caller's environment into the guest, and guest processes inherit it; whether the Riot client passes all of it to the game has not been checked; the log below shows the result. Darling's OpenGL uses EGL, so if the log below still shows the integrated GPU as the presenting renderer, also set `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json`. On two Mesa GPUs, `DRI_PRIME=1` does the same.
+`prime-run` sets `__NV_PRIME_RENDER_OFFLOAD=1`, `__VK_LAYER_NV_optimus=NVIDIA_only` and `__GLX_VENDOR_LIBRARY_NAME=nvidia`. `darling` copies the caller's environment into the guest, and guest processes inherit it; whether the Riot client passes all of it to the game has not been checked; the log below shows the result. Darling's OpenGL uses EGL, so if the log below still shows the integrated GPU as the presenting renderer, also set `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json`. On two Mesa GPUs, `DRI_PRIME=1` does the same. The RTX 5060 Laptop in [#53](https://github.com/lucannez64/darling-lol/issues/53) rendered with all four variables set:
+
+```sh
+__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only __GLX_VENDOR_LIBRARY_NAME=nvidia \
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json sh scripts/run.sh
+```
 
 The guest file `/tmp/metal-gpu` (a device index or part of its name, for example `nvidia`) moves only the Vulkan side. Use it for diagnosis: on its own it splits the two sides across GPUs, and frames cannot be presented.
 
 ### Check which GPU rendered
 
-Each process that uses Metal appends to guest `/tmp/metal-device.log` (host `~/.darling/private/tmp/metal-device.log`): every Vulkan device the loader reported, the selected one and why, and the renderer of the presenting OpenGL context with both device UUIDs:
+With `DARLING_METAL_DEVICE_LOG=1` in the launcher environment, each process that uses Metal appends to guest `/tmp/metal-device.log` (host `~/.darling/private/tmp/metal-device.log`): every Vulkan device the loader reported, the selected one and why, and the renderer of the presenting OpenGL context with both device UUIDs. The log is off by default because the guest can read it and it names the host GPU:
 
 ```
 [MetalDevice] pid=… physical name="NVIDIA GeForce RTX 3060 Laptop GPU" type=discrete vendorID=0x10de … supported=yes
@@ -309,33 +605,84 @@ The first import of a drawable into the presenting OpenGL context, and the first
 [MetalDevice] pid=… drawable GL semaphore (first) import_error=0x0 wait_error=0x0 ok (checked for the first 600 imports)
 ```
 
-A non-zero error or `FAILED` means the frames cannot reach the window. Before 2026-10-16 the import did not mark the memory as dedicated, which the extension requires; Mesa ignores it, and it is the suspected cause of the NVIDIA black screen (not yet confirmed). An NVIDIA log of 2026-10-16 showed `glTiling=optimal` with `setup_error=0x501 storage_error=0x501 FAILED`: NVIDIA's GL rejects `GL_LINEAR_TILING_EXT`, so the linear Vulkan image could not be imported. Since then the internal image and the GL texture use optimal tiling when `GL_VENDOR` contains NVIDIA (`vkTiling=optimal glTiling=optimal ok` is the expected line); everything else keeps linear. If the game shows a black screen on NVIDIA, report it with this file.
+A non-zero error or `FAILED` means the frames cannot reach the window. Before 2026-10-16 the import did not mark the memory as dedicated, which the extension requires; Mesa ignores it. It was suspected of causing the NVIDIA black screen; the causes found later were the window visual and the draw buffer (#22). An NVIDIA log of 2026-10-16 showed `glTiling=optimal` with `setup_error=0x501 storage_error=0x501 FAILED`: NVIDIA's GL rejects `GL_LINEAR_TILING_EXT`, so the linear Vulkan image could not be imported. Since then the internal image and the GL texture use optimal tiling when `GL_VENDOR` contains NVIDIA (`vkTiling=optimal glTiling=optimal ok` is the expected line); everything else keeps linear. If the game shows a black screen on NVIDIA, report it with this file.
 
-An additional NVIDIA report on `68f816d` showed successful optimal-tiling import but repeated `Metal Device timed out giving us a Drawable to present` messages. Its [presentation trace](https://github.com/lucannez64/darling-lol/issues/3#issuecomment-6214732591) shows all three drawables queued and all three main-thread presentation callbacks running, followed by timeouts with three frames still queued. The compositor only prepared a Metal layer when it was the root layer, skipping nested Metal layers. It now prepares Metal layers throughout the tree. A standalone nested-layer reproduction exhausts the pool before this correction and passes ten presentations with pixel readback after it; the root-layer probe also passes. Confirmation on the reporter's NVIDIA system is still needed.
+An additional NVIDIA report on `68f816d` showed successful optimal-tiling import but repeated `Metal Device timed out giving us a Drawable to present` messages. Its [presentation trace](https://github.com/lucannez64/darling-lol/issues/3#issuecomment-6214732591) shows all three drawables queued and all three main-thread presentation callbacks running, followed by timeouts with three frames still queued. The compositor only prepared a Metal layer when it was the root layer, skipping nested Metal layers. It now prepares Metal layers throughout the tree. A standalone nested-layer reproduction exhausts the pool before this correction and passes ten presentations with pixel readback after it; the root-layer probe also passes. Issue #3 has since been closed, and the game renders on NVIDIA (see [NVIDIA](#nvidia)).
 
-### NVIDIA proprietary driver
+### NVIDIA resize signals, CPU readback and completion latency
 
-Exercised on a single-GPU RTX 3060 desktop (driver 615.71, sway with Xwayland), playing custom matches. The client window still needs `RCLOL_GPU_DIRECT_PRESENT=0`: the direct GPU path reports no error, but its window stays black.
+The EGL-compatible window visual, compositor back buffer and collision-safe RPC
+socket allocation fixes are already part of the runtime. The remaining NVIDIA
+work covers these independent paths:
 
-- **Black game window, surface.** The compositor subwindow inherited its parent's GLX visual, and NVIDIA's EGL refuses a window surface for a config with another visual (`EGL_BAD_CONFIG`); Mesa accepts the mismatch. The subwindow is now created with the visual of CGL's EGL config (`CGLGetNativeVisualID`).
-- **Black game window, drawing.** The compositor context is first made current without a surface, so its default framebuffer kept `GL_NONE` as draw buffer after a window surface was attached, and NVIDIA discarded every composite. Attaching a new window surface now restores `GL_BACK`. `riot-metal-presentation-check` with `RIOT_PRESENTATION_HOLD=<seconds>` keeps presenting, so the window's real pixels can be read from the host.
-- **Frozen frame over the client.** With CPU readback the local compositor drew Chromium surfaces from a texture loaded once whenever the layer tree was not one full-window surface (the Practice Tool lobby video) and left that frame over the live client. In readback mode it now composites only trees that contain a Metal layer. On sway the client also stays visible during a match, because sway ignores X11 minimize requests.
-- **Aborts during a match.** NVIDIA's driver opens a `/dev/nvidia0` descriptor per Vulkan memory allocation, about 6,800 in a match, while Darling processes inherited the launching shell's limit (2048 here) and mldr keeps each thread's darlingserver socket just below it. The launcher now raises the soft limit to 65536, `setrlimit` no longer lowers `RLIMIT_NOFILE` (the game asks for 10240, which lowered a higher Linux limit and broke every later socket), and mldr logs socket and checkin failures as `LOLRPCSOCKET`/`LOLCHECKIN` in `/tmp/lolsig.log` and retries them.
-- **Signals on driver threads.** NVIDIA's driver threads do not block signals, so a process-directed signal (tmux sends `SIGWINCH` on every resize) could land on a thread without a darlingserver socket and abort the process. Such an asynchronous signal is now forwarded to the main thread.
-- **Frame rate.** NVIDIA's blocking `vkWaitSemaphores` wakes the waiter 1-2 ms after the GPU signals (an empty submit completes in about 15 us when polled). Indium now polls completion for up to 2 ms before blocking (guest file `/tmp/metal-wait-spin-us` sets the budget in microseconds, 0 disables it). A custom match went from about 20 to 27 FPS. The GPU still idles at low clocks, and an NVIDIA driver thread spends about 70% of a core in ioctls; locking the GPU clock did not help, and the cause is not identified yet.
-- **Client GPU name.** The launcher exports `DARLING_METAL_GPU_NAME` so the client sees a Mac-plausible GPU; `DARLING_METAL_GPU_NAME=` (empty) or a bare `darling` reports the host GPU. The substitution happens through that documented env override: with the launcher's default the name *is* replaced at launch, while the code path without the export only cleans up the host name and never substitutes one (see below).
+- A terminal resize can deliver `SIGWINCH` to a native driver thread without a
+  Darling RPC socket. The runtime forwards that resize notification to the guest
+  main thread; it keeps the existing handling for other signals and faults.
+- With `RCLOL_GPU_DIRECT_PRESENT=0`, Chromium frames arrive through CPU readback.
+  The local compositor skips non-Metal trees to avoid covering the live client
+  with stale cached textures. Mixed trees still prepare and present Metal layers.
+- NVIDIA timeline waits can wake late after GPU completion. Each device now polls
+  briefly while completions are pending before blocking: 2000 microseconds by
+  default on NVIDIA and zero on other vendors. An idle device blocks immediately.
+  The guest file `/tmp/metal-wait-spin-us` overrides the budget when the device is
+  created; `0` disables polling. Values are capped at 10000 microseconds and
+  malformed values use the vendor default. Restart Darling to change the budget.
+- The launcher raises the soft `RLIMIT_NOFILE` to 65536: NVIDIA's driver opens a
+  `/dev/nvidia0` descriptor per Vulkan memory allocation (about 6,800 in a
+  match), while Darling processes inherited the launching shell's limit.
+  `setrlimit` no longer lowers the limit the game asks for (10240), which used to
+  break every later darlingserver socket, and mldr logs socket and checkin
+  failures as `LOLRPCSOCKET`/`LOLCHECKIN` in `/tmp/lolsig.log` and retries them.
 
-### What Metal reports about the GPU
+The contributor reported custom matches on a single-GPU RTX 3060, driver 615.71,
+with sway/Xwayland using CPU readback. The initial polling change improved their
+reported rate from about 20 to 27 FPS. Those observations predate the narrowed
+integration; they do not establish hybrid-GPU or general NVIDIA support.
 
-`MTLDevice.name` is the selected Vulkan device's name in macOS style: the trailing driver note in brackets and the `(R)`/`(TM)` marks are removed (`AMD Radeon RX 6800 XT (RADV NAVI21)` becomes `AMD Radeon RX 6800 XT`, `Intel(R) UHD Graphics 630 (CML GT2)` becomes `Intel UHD Graphics 630`, `llvmpipe (LLVM …)` becomes `llvmpipe`). NVIDIA names are unchanged. The name is never replaced with another vendor's GPU. Before 2026-10-17 it was always `Darling Indium Device`.
+`riot-metal-presentation-check` with `RIOT_PRESENTATION_HOLD=<seconds>` keeps
+presenting, so the window's real pixels can be read from the host.
 
-`recommendedMaxWorkingSetSize` is the size of the device-local Vulkan heaps (the VRAM) on a discrete GPU. On integrated and software GPUs it is the size of all heaps, because their device-local heap can be just the firmware carve-out while they also use system RAM; macOS likewise reports a large share of system RAM for unified-memory GPUs. It falls back to the old 1 GiB when Vulkan reports no usable heap. `hasUnifiedMemory` stays `YES` by default: with `NO`, apps switch to managed and private resource paths (`synchronizeResource:`, private buffers created with data) that are not implemented here. Set these in the game's environment to override:
+### NVIDIA 580 (Pascal and older): black game window
 
-- `DARLING_METAL_GPU_NAME=<name>`: report this name.
-- `DARLING_METAL_VRAM_MB=<positive integer>`: report this working-set size in MiB. Other values are ignored.
-- `DARLING_METAL_HOST_UNIFIED_MEMORY=1`: report `hasUnifiedMemory` from the GPU type (`YES` for integrated and software GPUs, `NO` for discrete ones). This is experimental; on a discrete GPU it can break rendering.
+Driver 580 is the last branch for Pascal (GTX 10-series) and older GPUs. With
+`__GL_THREADED_OPTIMIZATIONS=1`, this driver with egl-x11 1.0.6 rejects the X11
+`EGLDisplay` with `EGL_BAD_DISPLAY` on every thread that has a context current.
+The display stays valid on other threads, and `eglReleaseThread()` makes it work
+again on the failing one. A small native EGL program outside Darling shows the
+same: `eglQueryString(display, EGL_VENDOR)` after `eglMakeCurrent` returns
+`NVIDIA` without the variable and fails with `EGL_BAD_DISPLAY` with it.
 
-Each process reads these once.
+In the Riot client the main thread loses EGL right after its first window frame;
+`CGLCreateContext` then fails with CGL error 10004 and, if another display is
+opened, glvnd hands it to Mesa's software renderer, which cannot present the
+game's NVIDIA Vulkan frames. The launcher therefore leaves threaded optimizations
+off (`__GL_THREADED_OPTIMIZATIONS=0`). Setting the variable to `1` before launch
+restores the old behaviour.
+
+Tested on a GTX 1060 6GB with driver 580.178.04 on NixOS, Hyprland and Xwayland:
+the client and the tutorial match render on the NVIDIA GPU. Newer drivers were not
+retested with the option off.
+
+### Metal device name and memory budget
+
+`MTLDevice` reports the host GPU: its Vulkan name in macOS style (for example
+`AMD Radeon RX 6800 XT (RADV NAVI21)` becomes `AMD Radeon RX 6800 XT`) and a working set
+(`recommendedMaxWorkingSetSize`) from the GPU's Vulkan memory heaps. Apps size their GPU
+allocations from the working set, so only override it to match the card's real memory.
+Both can be overridden per launch:
+
+```sh
+DARLING_METAL_GPU_NAME='AMD Radeon Pro 5500M' DARLING_METAL_VRAM_MB=4096 ./scripts/run.sh
+```
+
+The Riot launcher sets `DARLING_METAL_MAC_GPU_NAME=1`: the name becomes the GPU that
+the MacBookPro16,1 IOKit reports shipped with, from the host's vendor: `AMD Radeon Pro 5500M`
+on AMD and `Intel UHD Graphics 630` on Intel. NVIDIA GPUs keep their own name, so the game
+never takes AMD or Intel driver paths on an NVIDIA card. The working set is still the host's.
+`DARLING_METAL_MAC_GPU_NAME=0 ./scripts/run.sh` reports the host name instead; other Darling
+apps report it unless they set the variable. `DARLING_METAL_GPU_NAME` wins over both.
+
+`registryID` is a fixed non-zero value, as on a real Mac.
 
 ### Host-side checks
 
@@ -406,3 +753,78 @@ If a black fullscreen game has only its normal Metal child and becomes visible a
 ### Visible cursor while relative on Xwayland (PR #18)
 
 When Xwayland does not honour warps, the virtual cursor follows real pointer motion and application warps leave it in place. Expected warp echoes are still discarded using their request serial and coordinates. This keeps clicks and camera edge panning aligned with the visible cursor on GNOME/gamescope. The contributor confirmed this path in a gamescope practice-tool session; plain GNOME and NVIDIA still require manual verification.
+
+Recovery requires every matching client to be at least 60 seconds old and a
+complete Hyprland window record (`class`, `title`, `mapped`, `hidden`). A second
+process scan after window inspection must find the same client identities and
+no game. Missing information or shutdown failure leaves normal launch in charge.
+
+## Variable refresh rate (VRR)
+
+Full-window borderless game layers now use the opaque managed X11 parent
+surface for presentation. Previously they swapped an independent child while
+the managed parent remained static. Using one surface lets the compositor
+track the game's updates for VRR and avoids scanning out an empty parent.
+Partial views, titled windows and other applications retain child drawables.
+The child fallback retains the compositor-bypass prohibition that prevents
+black screens. The fullscreen parent path advertises `_VARIABLE_REFRESH=1`;
+leaving fullscreen clears that request. Desktop/driver policy still decides
+whether to enable adaptive sync.
+
+With the game and both clients closed, rebuild with `./scripts/update.sh`;
+CoreGraphics, QuartzCore and the X11 backend must be updated together. Enable
+VRR in the desktop and monitor, and compare the monitor's live refresh reading
+to a frame cap below its maximum refresh, initially with VSync off. VRR and
+VSync are separate: this change does not implement an in-game frame limiter.
+See [the VRR probe and manual checks](TESTING.md#vrr-presentation-regression-46).
+
+Standalone child, parent and nested-parent presentation probes passed locally;
+monitor-level VRR and the reporter's in-game behavior still need confirmation.
+
+## VSync and frame caps (#46)
+
+The Metal layer's `displaySyncEnabled` property previously had no effect on
+the window swap interval. A game that delegates pacing to VSync could run
+uncapped when VSync was enabled. The compositor now applies that property to
+the window before swapping, including nested Metal layers and setting changes.
+If several Metal layers share a window, any layer requesting VSync enables it
+for that window. Other windows retain independent swap settings.
+
+Exit the game and both clients, then run `./scripts/update.sh` to rebuild and
+install the QuartzCore and OpenGL changes. Until updated, disable in-game
+VSync to use the game's frame cap, as the issue reporter confirmed. Physical
+scanout timing still depends on the driver and desktop compositor; the fix
+has standalone regression coverage but needs an in-game timing retest.
+
+## Installer aborts on `/proc/<pid>/fdinfo`
+
+[Issue #38](https://github.com/lucannez64/darling-lol/issues/38) reports an
+uncaught `ghc::filesystem::filesystem_error` with `Permission denied` on
+`/proc/<pid>/fdinfo`. `ghc::filesystem` is a C++ filesystem library, not evidence
+that the Riot installer is written in Haskell.
+
+An independent guest/native Vulkan probe reproduced this exact exception with
+MangoHud 0.8.4 enabled on 2026-10-18. MangoHud's `GPU_fdinfo::find_fd()` builds
+`/proc/<getpid()>/fdinfo` and uses a throwing directory iterator. Inside Darling,
+the native library's PID is in the guest PID namespace while its native `/proc`
+view can still refer to host processes: the probe's native PID 35 resolved to an
+inaccessible host process. The same probe completed Vulkan instance, device and
+swapchain creation with MangoHud disabled. This does not establish the cause of
+every installer abort; confirmation from the original reporter remains pending.
+
+The normal launcher now unsets `MANGOHUD` and exports `DISABLE_MANGOHUD=1` before
+runtime helpers start, including first-time installation. This disables inherited
+implicit MangoHud activation for the launched session without changing the host
+configuration. Do not wrap the launcher in `mangohud` or explicitly force its
+Vulkan layer. Updating these launcher scripts needs no Darling rebuild. For an
+older checkout, use:
+
+```sh
+env -u MANGOHUD DISABLE_MANGOHUD=1 ./scripts/installer.sh euw
+```
+
+Do not run the installer as root or change `/proc` permissions. If it still
+fails, include the exception and whether a host overlay was enabled; redact
+account tokens from logs.
+
+Upstream source: [MangoHud 0.8.4 fdinfo scan](https://github.com/flightlessmango/MangoHud/blob/v0.8.4/src/gpu_fdinfo.cpp#L9).

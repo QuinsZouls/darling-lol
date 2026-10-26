@@ -8,11 +8,13 @@
       "revision": "60ba801decee7a00782f74f6be4c8ffb013f79ff",
       "repository": "https://github.com/darlinghq/darling.git",
       "patch": "patches/darling.patch",
-      "modified_files": 88,
+      "modified_files": 99,
       "new_files": [
-        "src/CoreAudio/CoreAudio/AudioConverterShim.c",
         "src/CoreAudio/AudioTrace.h",
+        "src/CoreAudio/CoreAudio/AudioConverterShim.c",
         "src/CoreAudio/CoreAudioComponent/MatrixMixerAU.cpp",
+        "src/frameworks/Accelerate/vecLib/vDSP/src/arith.c",
+        "src/frameworks/Accelerate/vecLib/vDSP/src/fft.c",
         "src/frameworks/Carbon/HIToolbox/src/SecureInput.c",
         "src/frameworks/CoreMedia/include/CoreMedia/CMFormatDescription.h",
         "src/frameworks/CoreServices/src/LaunchServices/LSHostOpen.c",
@@ -24,8 +26,8 @@
         "src/frameworks/OpenDirectory/src/ODLocalDirectory.m",
         "src/frameworks/OpenGL/CGLAsyncPresent.inc",
         "src/frameworks/OpenGL/include/OpenGL/DarlingNativePresent.h",
-        "src/startup/mldr/commpage-cpu-caps.h",
-        "src/shellspawn/shellspawn-fds.h"
+        "src/shellspawn/shellspawn-fds.h",
+        "src/startup/mldr/commpage-cpu-caps.h"
       ]
     },
     {
@@ -57,10 +59,11 @@
       "revision": "c8d38d16a9f613d300157bebbab2b9501bc0c274",
       "repository": "https://github.com/darlinghq/darling-cocotron.git",
       "patch": "patches/cocotron.patch",
-      "modified_files": 104,
+      "modified_files": 111,
       "new_files": [
-        "QuartzCore/include/QuartzCore/CATransformLayer.h",
-        "AppKit/NSGeometryTrace.h"
+        "AppKit/NSGeometryTrace.h",
+        "AppKit/X11.backend/X11RelativeMouse.h",
+        "QuartzCore/include/QuartzCore/CATransformLayer.h"
       ]
     },
     {
@@ -274,8 +277,9 @@
       "revision": "fa29287aa2f0115271e091f1031f53c9e024005d",
       "repository": "https://github.com/darlinghq/darling-xnu.git",
       "patch": "patches/xnu.patch",
-      "modified_files": 64,
+      "modified_files": 67,
       "new_files": [
+        "darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h",
         "darling/src/libsystem_kernel/emulation/include/common/cpu_topology.h",
         "darling/src/libsystem_kernel/emulation/include/common/private_mutex.h",
         "darling/src/libsystem_kernel/emulation/include/common/slowwait.h",
@@ -284,8 +288,7 @@
         "darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/misc/mac_syscall.h",
         "darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/guarded/change_fdguard_np.c",
         "darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/mac_syscall.c",
-        "libsyscall/wrappers/__sysctlbyname.S",
-        "darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h"
+        "libsyscall/wrappers/__sysctlbyname.S"
       ]
     },
     {
@@ -293,8 +296,9 @@
       "revision": "8423a7d2f053167030d2bc4a227f96243c740667",
       "repository": "https://github.com/darlinghq/indium.git",
       "patch": "patches/metal--deps--indium.patch",
-      "modified_files": 36,
+      "modified_files": 38,
       "new_files": [
+        "private-include/indium/completion-spin.private.hpp",
         "private-include/indium/counters.private.hpp",
         "private-include/indium/deferred-blit-encoder.private.hpp",
         "private-include/indium/deferred-render-encoder.private.hpp",
@@ -315,8 +319,13 @@
       "revision": "e7e3db881008d883f82914765a72ce842bcba735",
       "repository": "https://github.com/darlinghq/darling-cfnetwork.git",
       "patch": "patches/cfnetwork.patch",
-      "modified_files": 1,
+      "modified_files": 4,
       "new_files": []
+    },
+    {
+      "path": "src/external/cctools-port",
+      "revision": "d9456c221e1f462e17c0b3297748bc089d5a861e",
+      "patch": "patches/cctools-port.patch"
     }
   ],
   "omitted": [
