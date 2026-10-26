@@ -79,6 +79,13 @@ fi
 #                        -> G-DEB-4 INSIDE the container (MENOR-3). An offline run cannot see it,
 #                        which is exactly the gap MENOR-3 names, so the control lives below with the
 #                        other container controls.
+#   flat-fatal           restore run 39258643917's bug IN THE GENERATOR: the real, flat upstream
+#                        debian/copyright (no Format: header, no stanzas -- the shape the pin
+#                        actually ships) FATALs again -> the flat-shape builder row
+#   flat-unindented      the naive fix: copy the flat upstream notices byte-for-byte at column 0
+#                        instead of as Comment continuations -> the shipped-flat structure row
+#                        (lintian does NOT parse the shipped doc copyright -- measured -- so this
+#                        is discharged offline, not in the container)
 BREAK=${T3_GATES_BREAK:-}
 KEEP=${T3_KEEP:-0}
 # T3_LINTIAN_FAILON=<level>  the container's `lintian --fail-on <level>` (default: error, the
@@ -124,8 +131,7 @@ TAG=v0.1.0
 VERSION=0.1.0+lol-1
 UPSTREAM=$WORK/upstream-copyright
 
-# The synthetic upstream debian/copyright. Written BY the harness, NOT the real pinned file (that
-# one lives in the prepared checkout, ~33k, and is not in this repo). Its Files:/License: stanzas
+# The synthetic upstream debian/copyright. Written BY the harness. Its Files:/License: stanzas
 # carry a path and a short name that appear nowhere else in the tree, so the rows below can prove
 # the SHIPPED copyright was generated from this input instead of typed into the payload.
 cat > "$UPSTREAM" <<'EOF'
@@ -141,6 +147,21 @@ License: T3-Harness-Marker-1.0
 Files: src/frameworks/*
 Copyright: 2008-2026 Apple Inc. and the Darling contributors
 License: APSL-2.0
+EOF
+
+# The OTHER shape: what the pin ACTUALLY ships. This harness used to describe the real
+# build/darling-src/debian/copyright as a "~33k" DEP-5 document -- fiction, measured by runs
+# 39245729525/39258643917: at 60ba801d it is a flat three-line notice, no Format: header, no
+# blank-line-separated stanzas, and the generator that only understood the shape above died on
+# it inside build-all's fail-fast, taking rpm and tar with it. A fixture whose shape differs
+# from production is how that class survives a green battery; UPSTREAM_FLAT is the same bytes
+# the CI checkout feeds the builder.
+UPSTREAM_FLAT=$WORK/upstream-copyright-flat
+cat > "$UPSTREAM_FLAT" <<'EOF'
+Copyright (C) 2012-2023 Darling developers
+Copyright (C) 1999-2017 Apple, Inc.
+Copyright (C) 1989-2005 Free Software Foundation, Inc.
+
 EOF
 
 # --- the object under test ----------------------------------------------------------------------
@@ -208,6 +229,19 @@ if [ -n "$BREAK" ]; then
       # load-bearing for `lintian --fail-on error`; the older `override-tag` label deletes a
       # *warning* tag, so it proves the in-tree TEXT row, not the gate.
       sed -i '/^binary-from-other-architecture /d' "$MUT/packaging/deb/darling-lol.lintian-overrides" ;;
+    flat-fatal)
+      # run 39258643917's bug, restored: send the generator's verbatim branch into emit_header's
+      # unknown-mode refusal, i.e. make the REAL flat shape FATAL again. The flat builder row is
+      # what must redden -- production feeds build-deb.sh exactly this shape.
+      sed -i 's/^      emit_header verbatim$/      emit_header nosuchmode/' \
+        "$MUT/packaging/deb/mk-copyright.sh" ;;
+    flat-unindented)
+      # the naive fix: copy the flat notices byte-for-byte at column 0. That opens a malformed
+      # DEP-5 paragraph -- and lintian does NOT parse the shipped doc copyright (measured with
+      # the container's 2.122: neither shape earns an E:), so the structural row is what must
+      # see it, offline.
+      sed -i 's/printf " %s\\n", line\[i\]/printf "%s\\n", line[i]/' \
+        "$MUT/packaging/deb/mk-copyright.sh" ;;
     *) echo "run-deb-gates: unknown T3_GATES_BREAK='$BREAK'" >&2; exit 2 ;;
   esac
   BUILDER=$B
@@ -221,6 +255,7 @@ if [ -n "$BREAK" ]; then
     essential-depends) cmp -s "$MUT/packaging/deb/launcher-control.in" packaging/deb/launcher-control.in ;;
     no-trailing-newline) cmp -s "$MUT/packaging/deb/prerm" packaging/deb/prerm ;;
     binary-version) cmp -s "$MUT/packaging/common/render.sh" packaging/common/render.sh ;;
+    flat-fatal | flat-unindented) cmp -s "$MUT/packaging/deb/mk-copyright.sh" packaging/deb/mk-copyright.sh ;;
   esac && { echo "run-deb-gates: T3_GATES_BREAK=$BREAK changed nothing -- refusing (the sed matched nothing)" >&2; exit 2; }
 else
   BUILDER=packaging/common/build-deb.sh
@@ -512,6 +547,62 @@ sh packaging/deb/mk-copyright.sh --upstream /nonexistent/pinned/debian/copyright
 chk "fixture mode (--if-missing note) says the stanzas were omitted" \
   "$(cnt 'upstream stanzas omitted' "$WORK/copyright.4")" 1
 
+# --- the REAL pinned shape -----------------------------------------------------------------------
+sec "the REAL pinned shape: a flat notice, no Format: header, no stanzas (run 39258643917)"
+# Everything above feeds the generator the DEP-5 shape. This section feeds it -- and the full
+# builder, and the container below -- the shape the pin actually ships. The divergence between
+# the two is the class that killed the packages job twice and, through build-all's fail-fast,
+# kept rpm and tar from ever running in production.
+rc=0; sh packaging/deb/mk-copyright.sh --upstream "$UPSTREAM_FLAT" --if-missing fail \
+  --out "$WORK/copyright.flat" 2>"$WORK/cop.flat.err" || rc=$?
+chk "mk-copyright.sh exits 0 over the REAL shape, in production mode" "$rc" 0
+chk "the three notices are all present, as Comment continuations" \
+  "$(cnt '^ Copyright (C) ' "$WORK/copyright.flat")" 3
+chk "no notice stands at column 0 (that would open a malformed paragraph)" \
+  "$(cnt '^Copyright (C) ' "$WORK/copyright.flat")" 0
+chk "still exactly one header paragraph" "$(cnt '^Upstream-Name: ' "$WORK/copyright.flat")" 1
+chk "and exactly one Files: paragraph (the generator invented no stanza)" \
+  "$(cnt '^Files: ' "$WORK/copyright.flat")" 1
+sh packaging/deb/mk-copyright.sh --upstream "$UPSTREAM_FLAT" --out "$WORK/copyright.flat2" 2>/dev/null || true
+chk "the flat output regenerates byte-identically" \
+  "$(cmp -s "$WORK/copyright.flat" "$WORK/copyright.flat2" && echo identical || echo differs)" identical
+# the fail-closed classes stay dead: a DEP-5 file whose body is empty, and a file with no text
+# at all, must still refuse -- the verbatim branch must not become a licence to emit nothing.
+printf 'Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n\n' \
+  > "$WORK/dep5-no-stanzas"
+rc=0; sh packaging/deb/mk-copyright.sh --upstream "$WORK/dep5-no-stanzas" \
+  --out "$WORK/copyright.ns" 2>/dev/null || rc=$?
+chk "a DEP-5 file with an empty body still FATALs (the old fail-closed rule survives)" "$rc" 1
+printf '   \n\n\t\n' > "$WORK/blank-only"
+rc=0; sh packaging/deb/mk-copyright.sh --upstream "$WORK/blank-only" \
+  --out "$WORK/copyright.bo" 2>/dev/null || rc=$?
+chk "a whitespace-only file still FATALs" "$rc" 1
+# and the REAL builder, end to end, over the real shape -- the exact call the CI packages job
+# makes through build-all.sh. The flat pair gets its own DIST so the synthetic object under test
+# is untouched; the container section below lints BOTH pairs.
+DIST_FLAT=$WORK/dist-flat
+rc=0
+env DIST="$DIST_FLAT" FIXTURE_DIR="$DIST_FLAT/fixture" UPSTREAM_COPYRIGHT="$UPSTREAM_FLAT" \
+  sh "$BUILDER" fixture > "$WORK/build-flat.log" 2>&1 || rc=$?
+sed 's/^/    /' "$WORK/build-flat.log"
+chk "the builder exits 0 over the pinned REAL shape (flat copyright)" "$rc" 0
+chk "the flat build reports no FATAL" "$(cnt 'FATAL' "$WORK/build-flat.log")" 0
+chk "the flat-shape artifacts exist and are non-empty" \
+  "$([ -s "$DIST_FLAT/fix.deb" ] && [ -s "$DIST_FLAT/fix-launcher.deb" ] && echo 2 || echo 0)" 2
+dpkg-deb -x "$DIST_FLAT/fix.deb" "$WORK/flat.x" || true
+chk "the SHIPPED flat-shape copyright keeps the three notices as continuations" \
+  "$(cnt '^ Copyright (C) ' "$WORK/flat.x/usr/share/doc/darling-lol/copyright")" 3
+chk "and ships no column-0 notice (the malformed-paragraph class stays closed)" \
+  "$(cnt '^Copyright (C) ' "$WORK/flat.x/usr/share/doc/darling-lol/copyright")" 0
+# when the prepared checkout exists on this box, the generator must survive the pin itself, not
+# just the harness's copy of its shape.
+if [ -r build/darling-src/debian/copyright ]; then
+  rc=0; sh packaging/deb/mk-copyright.sh --out "$WORK/copyright.pin" 2>"$WORK/cop.pin.err" || rc=$?
+  chk "the generator exits 0 over the REAL pinned checkout on this box" "$rc" 0
+else
+  skip "the generator vs build/darling-src/debian/copyright (needs scripts/prepare.py on this box)"
+fi
+
 # --- C4: the changelog ---------------------------------------------------------------------------
 sec "the changelog (C4: E: no-changelog)"
 chk "changelog.Debian.gz is in BOTH packages" \
@@ -582,6 +673,11 @@ else
   # that check needs no package at all -- so it runs first, and it is the row that catches a
   # copy-paste from PLAN 9.6 (five of its names are unknown to lintian 2.117, see finding F9).
   grep -vE '^(#|$)' "$WORK/overrides" | awk '{print $1}' | LC_ALL=C sort -u > "$DIST/override-tags.txt"
+  # the flat-shape pair rides the same mount: /w is $DIST, so the two copies below join fix.deb
+  # and fix-launcher.deb. If the flat build itself failed, these cp errors are noise next to what
+  # the offline rows already said; the container's LINTIAN_FLAT_RC row is what stays honest.
+  cp "$DIST_FLAT/fix.deb" "$DIST/fix-flat.deb"
+  cp "$DIST_FLAT/fix-launcher.deb" "$DIST/fix-flat-launcher.deb"
   # T3_LINTIAN_FAILON is a control-only knob (default: error, the brief's level). The negative
   # control at the bottom sets it to `warning` to prove the two rc rows below are not vacuous: this
   # object's 8 W: lines make lintian exit 2 WITHOUT printing an E: line, so the "0 E: lines" row
@@ -607,6 +703,16 @@ else
     # `warning` control below is what keeps this honest).
     lintian --fail-on '"$FA"' --no-tag-display-limit /w/fix.deb /w/fix-launcher.deb; lrc=$?
     echo "LINTIAN_CLEAN_RC=$lrc"
+    # the flat-shape pair (the upstream copyright the REAL pin ships) gets its own invocation and
+    # its own markers, so a regression in either shape names itself instead of blending into the
+    # aggregate E: count. The container still exits with the status OF THE SYNTHETIC PAIR: the
+    # rows whose controls already depend on that keep their meaning, and the flat pair has its
+    # own rc row below.
+    lintian --fail-on '"$FA"' --no-tag-display-limit /w/fix-flat.deb /w/fix-flat-launcher.deb \
+      > /tmp/flat.out 2>&1; flrc=$?
+    cat /tmp/flat.out
+    echo "E_FLAT_COUNT=$(grep -c "^E: " /tmp/flat.out || true)"
+    echo "LINTIAN_FLAT_RC=$flrc"
     exit $lrc' 2>&1) || lrc=$?
   printf '%s\n' "$lout" > "$WORK/lintian.log"
   sed 's/^/    /' "$WORK/lintian.log"
@@ -614,10 +720,17 @@ else
     "$(cnt '^LINTIAN_VERSION=' "$WORK/lintian.log")" 1
   chk "every tag name in the override files is one the gate's lintian knows (0 alien; F9)" \
     "$(cnt '^UNKNOWN_TAG_COUNT=0$' "$WORK/lintian.log")" 1
-  chk "0 E: lines over both packages" "$(cnt '^E: ' "$WORK/lintian.log")" 0
+  chk "0 E: lines over all four packages (both upstream shapes)" "$(cnt '^E: ' "$WORK/lintian.log")" 0
   chk "lintian --fail-on error exits 0, and says so itself" \
     "$(cnt '^LINTIAN_CLEAN_RC=0$' "$WORK/lintian.log")" 1
   chk "the container exited 0" "$lrc" 0
+  # the flat pair's own rows: ran, clean, and rc reported by lintian itself (the same honesty the
+  # synthetic pair's control above established for the first invocation).
+  chk "the flat pair was lintian'd too (its own rc marker reported)" \
+    "$(cnt '^LINTIAN_FLAT_RC=' "$WORK/lintian.log")" 1
+  chk "0 E: lines over the flat pair" "$(cnt '^E_FLAT_COUNT=0$' "$WORK/lintian.log")" 1
+  chk "lintian --fail-on error exits 0 over the flat pair, and says so itself" \
+    "$(cnt '^LINTIAN_FLAT_RC=0$' "$WORK/lintian.log")" 1
 fi
 
 # --- hygiene -------------------------------------------------------------------------------------
@@ -672,6 +785,13 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
   # MENOR-4: the builder's own default, made addressless (the state render.sh:27 still ships). The
   # guard rows that assert the deb path never relies on render.sh's default are what redden.
   ctl maintainer-addressless "build-deb.sh's OWN default carries an address (a bare address is E: no-phrase)"
+  # run 39258643917's class: the REAL upstream shape, restored to FATAL in the generator. The
+  # flat builder row is the swept one -- production feeds build-deb.sh exactly this file, and the
+  # direct generator rows read the repo's script, so only the builder-driven row can see it.
+  ctl flat-fatal        "the builder exits 0 over the pinned REAL shape (flat copyright)"
+  # the naive fix (column-0 copy) opens a malformed paragraph lintian never parses in a shipped
+  # doc copyright (measured) -- so the structural row, not the container, is its discharge.
+  ctl flat-unindented   "the SHIPPED flat-shape copyright keeps the three notices as continuations"
 
   # G-DEB-4 is the row the container work exists for, so it must be able to go red too -- and only
   # the container can show that: the same no-copyright mutation makes lintian report
@@ -680,7 +800,7 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
   # It needs the same container as the row itself, so it is SKIPped without T3_GATES_DOCKER=1.
   if [ "${T3_GATES_DOCKER:-0}" = 1 ] && command -v docker >/dev/null 2>&1; then
     crc=0; cout=$(T3_GATES_BREAK=no-copyright bash "$0" 2>&1) || crc=$?
-    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over both packages")
+    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over all four packages (both upstream shapes)")
     if [ "$crc" != 0 ] && [ "$cn" = 1 ]; then ok "T3_GATES_BREAK=no-copyright -> G-DEB-4 goes red INSIDE the container (rc $crc)"
     else no "T3_GATES_BREAK=no-copyright: G-DEB-4 did not go red inside the container (rc $crc, $cn matching rows)"; fi
     ck=$(printf '%s\n' "$cout" | grep -cF "E: darling-lol: no-copyright-file")
@@ -690,11 +810,11 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
     # MENOR-3: the plan's own override mutation, discharged IN-TREE. `override-tag` above deletes a
     # *warning*-severity line, which proves the in-tree TEXT row but leaves `--fail-on error` at rc 0
     # (F14). This deletes an *error*-severity line, so only the container can see it: the child's
-    # "0 E: lines over both packages" row must fail and lintian must print
+    # "0 E: lines over all four packages" row must fail and lintian must print
     # `E: darling-lol: binary-from-other-architecture` for both stand-ins. Without this control the
     # override list's container load-bearing-ness would be asserted nowhere in the deliverable.
     crc=0; cout=$(T3_GATES_BREAK=override-error-tag bash "$0" 2>&1) || crc=$?
-    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over both packages")
+    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over all four packages (both upstream shapes)")
     if [ "$crc" != 0 ] && [ "$cn" = 1 ]; then ok "T3_GATES_BREAK=override-error-tag -> G-DEB-4 goes red INSIDE the container (rc $crc)"
     else no "T3_GATES_BREAK=override-error-tag: G-DEB-4 did not go red inside the container (rc $crc, $cn matching rows)"; fi
     ck=$(printf '%s\n' "$cout" | grep -cF "E: darling-lol: binary-from-other-architecture")
@@ -706,7 +826,7 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
     # (`darling-lol maintainers <darling-lol maintainers <addr>>`); dpkg-deb accepts it (rc 0), so
     # only lintian sees it -- and it must print `E: malformed-contact`.
     crc=0; cout=$(T3_GATES_BREAK=maintainer-wrapped bash "$0" 2>&1) || crc=$?
-    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over both packages")
+    cn=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g" | grep -cF "FAIL 0 E: lines over all four packages (both upstream shapes)")
     if [ "$crc" != 0 ] && [ "$cn" = 1 ]; then ok "T3_GATES_BREAK=maintainer-wrapped -> G-DEB-4 goes red INSIDE the container (rc $crc)"
     else no "T3_GATES_BREAK=maintainer-wrapped: G-DEB-4 did not go red inside the container (rc $crc, $cn matching rows)"; fi
     ck=$(printf '%s\n' "$cout" | grep -cF "E: darling-lol: malformed-contact")
@@ -723,7 +843,7 @@ if [ -z "$BREAK" ] && [ -z "$NO_CONTROL" ]; then
     cout=$(printf '%s\n' "$cout" | sed "s/${esc}\[[0-9;]*m//g")
     cn=$(printf '%s\n' "$cout" | grep -cF "FAIL lintian --fail-on error exits 0, and says so itself")
     ck=$(printf '%s\n' "$cout" | grep -cF "FAIL the container exited 0")
-    ce=$(printf '%s\n' "$cout" | grep -cF "FAIL 0 E: lines over both packages")
+    ce=$(printf '%s\n' "$cout" | grep -cF "FAIL 0 E: lines over all four packages (both upstream shapes)")
     if [ "$crc" != 0 ] && [ "$cn" = 1 ] && [ "$ck" = 1 ] && [ "$ce" = 0 ]; then
       ok "T3_LINTIAN_FAILON=warning -> both rc rows go red and the E-line row does not (rc $crc)"
     else
