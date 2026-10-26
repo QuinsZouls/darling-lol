@@ -346,6 +346,20 @@ sh packaging/common/check-prefix.sh "$WORK/pfx/root" "$WORK/pfx/files.all" >"$WO
 chk "'PREFIX: OK' printed" "$(grep -c '^PREFIX: OK$' "$WORK/pfx.log")" 1
 chk "guest count reported" "$(grep -c 'guest-side files containing' "$WORK/pfx.log")" 1
 
+sec "G-PREFIX-1b  every staged tools/ file carrying /usr/local is on the allowlist"
+# tools/ ships VERBATIM into usr/lib/darling-lol/tools (build-launcher.sh), so a new tool with the
+# /usr/local fallback turns G-PREFIX-1 red only ~30 minutes into the package build: run #67 died on
+# two riot checks, and the very next upstream merge added doctor.py. The set is assertable from the
+# checkout in milliseconds, so assert it here instead of learning it from a red CI job.
+( cd tools && grep -rlI 'usr/local' . 2>/dev/null || true ) \
+  | sed 's|^\./||; s|^|usr/lib/darling-lol/tools/|' | LC_ALL=C sort > "$WORK/pfxb.hits"
+sh packaging/common/check-prefix.sh --print-allowlist | grep -v '^$' | LC_ALL=C sort > "$WORK/pfxb.allow"
+chk "the scan found the fallback readers (non-empty, so the row is not vacuously green)" \
+  "$([ -s "$WORK/pfxb.hits" ] && echo yes || echo no)" yes
+chk "no tools/ file carrying /usr/local is missing from the allowlist" \
+  "$(comm -23 "$WORK/pfxb.hits" "$WORK/pfxb.allow" | wc -l | tr -d ' ')" 0
+printf '%s\n' "$(comm -23 "$WORK/pfxb.hits" "$WORK/pfxb.allow" | sed 's/^/    unallowlisted: /')" | grep -v '^$' || true
+
 sec "info  current-state probe: the fixture pre-applies T8's fix, the real file does not"
 prc=0; sh packaging/testdata/state-probe.sh >"$WORK/probe.log" 2>&1 || prc=$?
 sed 's/^/    /' "$WORK/probe.log"

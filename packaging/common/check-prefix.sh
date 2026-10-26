@@ -25,6 +25,13 @@ set -eu
 #   usr/lib/darling-lol/tools/build-riot-urlsession-check.py -- the same FALLBACK-reader class as
 #     the two power checks above. NEW on upstream main: the merge added it to the verbatim-staged
 #     tools/, which is what turned G-PREFIX-1 red (T8c).
+#   usr/lib/darling-lol/tools/build-riot-{openpanel,save-panel-tag}-check.py -- the SAME one-line
+#     fallback as the power/metal/x11 twin class (`sdk = config['sdk'] if config.exists() else
+#     '/usr/local/libexec/darling'`), read-only, and dead as soon as build/config.json exists.
+#     They ship verbatim, so run #67 died here at 18:01Z with both paths named.
+#   usr/lib/darling-lol/tools/doctor.py -- a HOST diagnostic: it probes the two candidate prefixes
+#     of an installation it did not build (icd.d under /usr/local/share, /usr/local/libexec/darling)
+#     and prints one as a fallback fact. Reads only; it writes nothing outside its own report.
 #   usr/lib/darling-lol/tools/riot_overlay_audit.py -- prose in a docstring.
 # install-riot-darling-server.py is deliberately NOT allowlisted: T1 removed its literal, so a
 # regression there must fail this gate (mutation M7 -- it WAS a write target, i.e. a live bug).
@@ -36,6 +43,9 @@ usr/lib/darling-lol/tools/build-riot-power-notify-check.py
 usr/lib/darling-lol/tools/build-riot-metal-presentation.py
 usr/lib/darling-lol/tools/build-riot-x11-runtime.py
 usr/lib/darling-lol/tools/build-riot-urlsession-check.py
+usr/lib/darling-lol/tools/build-riot-openpanel-check.py
+usr/lib/darling-lol/tools/build-riot-save-panel-tag-check.py
+usr/lib/darling-lol/tools/doctor.py
 usr/lib/darling-lol/tools/riot_overlay_audit.py
 '
 

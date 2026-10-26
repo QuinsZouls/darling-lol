@@ -4,7 +4,8 @@
 # A real /usr build cannot be produced on a dev box (the runtime is x86-64 and needs a full
 # cmake build), so the prefix gate is exercised against a fixture that reproduces the byte-level
 # facts the gate asserts: the three host ELFs' string content, the launcher's allowlisted fork
-# stubs (4 of the 8 names check-prefix.sh allowlists -- the shipped list has 8 since T8c), a
+# stubs (4 of the 11 names check-prefix.sh allowlists -- the shipped list has 11 since the
+# 2026-10-26 /usr-local-fallback tools landed), a
 # T8-fixed installer, guest macOS files that legitimately contain /usr/local, an
 # empty directory, and the Volumes/DarlingEmulatedDrive -> / escape (EVIDENCE C19/§7.5).
 #
@@ -64,7 +65,7 @@ prefix_guest() {
   printf '\177ELF\000/usr/local/libexec/darling\000guest\000' > "$_g/usr/lib/libguest.bin"
 }
 
-# prefix_host ROOT -- host-side files, the launcher's allowlisted fork stubs (4 of the 8 names
+# prefix_host ROOT -- host-side files, the launcher's allowlisted fork stubs (4 of the 11 names
 # check-prefix.sh allowlists), the T8 fix and the C19 escape.
 prefix_host() {
   _root=$1
@@ -77,9 +78,10 @@ prefix_host() {
   printf '%s\n' '#!/bin/sh' '# fixture launcher' > "$_root/usr/bin/darling-lol"
   chmod 0755 "$_root/usr/bin/darling-lol"
   printf '%s\n' '# fixture README-packaging' > "$_root/usr/share/doc/darling-lol/README-packaging.md"
-  # The 4 allowlisted fork stubs THIS FIXTURE writes -- 4 of the 7 fork files the gate allowlists;
-  # the 8th allowlisted name is usr/bin/darling-lol (written above as a 2-line stub), and the 3
-  # remaining tools (metal-presentation, x11-runtime, urlsession-check) are not reproduced here.
+  # The 4 allowlisted fork stubs THIS FIXTURE writes -- 4 of the 10 fork files the gate allowlists;
+  # the 11th allowlisted name is usr/bin/darling-lol (written above as a 2-line stub), and the 6
+  # remaining tools (metal-presentation, x11-runtime, urlsession-check, the two riot checks that
+  # turned run #67 red, and doctor.py) are not reproduced here.
   # Each stub keeps its literal /usr/local (PLAN §4.1). The allowlist itself lives in
   # check-prefix.sh's ALLOW_PATHS, never here (T8d).
   printf '%s\n' "return {'sdk': '/usr/local/libexec/darling'}" \
