@@ -51,26 +51,34 @@ reserved = socket.socket()
 reserved.bind(('127.0.0.1', 0))  # Reserved but not listening: deterministic connection refusal.
 Thread(target=server.serve_forever, daemon=True).start()
 (root / 'build').mkdir(exist_ok=True)
-prefix = Path(tempfile.mkdtemp(prefix='urlsession-prefix-', dir=root / 'build'))
+# Darling initializes account/configuration files only for an absent prefix.
+# Reserve its private parent, not DPREFIX itself.
+private_root = Path(tempfile.mkdtemp(prefix='urlsession-', dir=root / 'build'))
+prefix = private_root / 'prefix'
 env = {key: os.environ[key] for key in ('PATH', 'HOME', 'USER', 'LOGNAME', 'DISPLAY',
        'XAUTHORITY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'LANG') if key in os.environ}
-env.update(DPREFIX=str(prefix), EGL_PLATFORM='x11', LC_ALL='en_US.UTF-8',
-           DYLD_FRAMEWORK_PATH='/Volumes/SystemRoot' + str(frameworks.resolve()),
-           DYLD_LIBRARY_PATH='/Volumes/SystemRoot' + str(libraries.resolve()))
+env.update(DPREFIX=str(prefix), EGL_PLATFORM='x11', LC_ALL='en_US.UTF-8')
 log = args.log
 result = None
 try:
     with log.open('w') as stream:
         os.chmod(log, 0o600)
-        result = subprocess.run(['darling', str(args.probe.resolve()),
+        # Apply overlays to the probe only, after the private namespace boots.
+        # launchd/shellspawn must start against the installed base runtime.
+        result = subprocess.run(['darling', 'shell', 'env',
+                                 'DYLD_FRAMEWORK_PATH=/Volumes/SystemRoot' + str(frameworks.resolve()),
+                                 'DYLD_LIBRARY_PATH=/Volumes/SystemRoot' + str(libraries.resolve()),
+                                 '/Volumes/SystemRoot' + str(args.probe.resolve()),
                                  f'http://127.0.0.1:{server.server_port}/payload',
                                  f'http://127.0.0.1:{reserved.getsockname()[1]}/payload'],
                                 env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=90)
     text = log.read_text(errors='replace')
     for line in text.splitlines():
-        if line.startswith(('LIFECYCLE_PASS:', 'URLSESSION_PASS:', 'LIFECYCLE_FAIL', 'FAIL ', 'TIMEOUT')):
+        if line.startswith(('LIFECYCLE_PASS:', 'URLSESSION_PASS:', 'SHARED_SESSION_PASS:', 'QUEUE_PASS:',
+                            'LIFECYCLE_FAIL', 'SHARED_SESSION_FAIL', 'QUEUE_FAIL', 'FAIL ', 'TIMEOUT')):
             print(line)
-    if result.returncode or 'LIFECYCLE_PASS:' not in text or 'URLSESSION_PASS:' not in text:
+    required = ('LIFECYCLE_PASS:', 'URLSESSION_PASS:', 'SHARED_SESSION_PASS:', 'QUEUE_PASS:')
+    if result.returncode or not all(marker in text for marker in required):
         raise SystemExit(f'Probe failed (exit {result.returncode}); inspect private log {log}')
 finally:
     server.shutdown()
@@ -79,8 +87,8 @@ finally:
     try:
         stopped = subprocess.run(['darling', 'shutdown'], env=env, capture_output=True, timeout=25)
         if stopped.returncode == 0:
-            shutil.rmtree(prefix)
+            shutil.rmtree(private_root)
         else:
-            print('Private test prefix retained for inspection:', prefix)
+            print('Private test artifacts retained for inspection:', private_root)
     except (OSError, subprocess.SubprocessError):
-        print('Private test prefix retained for inspection:', prefix)
+        print('Private test artifacts retained for inspection:', private_root)

@@ -115,6 +115,33 @@ index 207dae6..f5e96db 100644
  #ifndef BUILDING_BASE_C
  
  VISIBLE
+diff --git a/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
+new file mode 100644
+index 0000000..eb90f43
+--- /dev/null
++++ b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
+@@ -0,0 +1,21 @@
++#ifndef DARLING_CPU_FREQUENCY_H
++#define DARLING_CPU_FREQUENCY_H
++#include <stdint.h>
++#include <stdbool.h>
++
++// Linux cpufreq exposes kHz; Darwin's hw.cpufrequency is an unsigned 64-bit Hz value.
++static inline bool darling_frequency_hz(const char* text, uint64_t* result)
++{
++    uint64_t value = 0;
++    if (!text || !result || *text < '0' || *text > '9') return false;
++    do {
++        unsigned digit = (unsigned)(*text++ - '0');
++        if (value > (UINT64_MAX - digit) / 10) return false;
++        value = value * 10 + digit;
++    } while (*text >= '0' && *text <= '9');
++    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') ++text;
++    if (*text || !value || value > UINT64_MAX / 1000) return false;
++    *result = value * 1000;
++    return true;
++}
++#endif
 diff --git a/darling/src/libsystem_kernel/emulation/include/common/cpu_topology.h b/darling/src/libsystem_kernel/emulation/include/common/cpu_topology.h
 new file mode 100644
 index 0000000..8ae1665
@@ -1576,7 +1603,7 @@ index dc8fbb8..171746a 100644
 +	__linux_sched_yield_site("SWTYLD");
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
-index 206e92e..011c8ca 100644
+index 206e92e..1a763fe 100644
 --- a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
 +++ b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
 @@ -151,8 +151,13 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
@@ -1595,7 +1622,7 @@ index 206e92e..011c8ca 100644
  	}
  
  	if (signum == SIGNAL_SIGEXC_SUSPEND) {
-@@ -267,13 +272,168 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
+@@ -267,13 +272,165 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
  #endif
  }
  
@@ -1673,28 +1700,25 @@ index 206e92e..011c8ca 100644
 +
 +#endif
 +
++/* Native driver threads have no Darling RPC connection. Forward resize
++ * notifications to the guest main thread without allocating or using RPC.
++ * Other signals, including synchronous faults and queued payloads, retain
++ * their existing handling. Never swallow a failed forward. */
++static int forward_native_resize_signal(int linux_signum, int status) {
++    if (status != -32 /* -LINUX_EPIPE */ || linux_signum != LINUX_SIGWINCH)
++        return 0;
++    long pid = LINUX_SYSCALL(__NR_getpid);
++    if (LINUX_SYSCALL(__NR_gettid) == pid)
++        return 0;
++    return LINUX_SYSCALL(__NR_tgkill, pid, pid, linux_signum) == 0;
++}
++
  void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
  {
  	int status = dserver_rpc_interrupt_enter();
++	if (forward_native_resize_signal(linux_signum, status))
++		return;
 +	int relaxed = 0;
-+
-+	/* darling-lol: threads created by native host libraries (for example NVIDIA's
-+	 * driver threads, which do not block signals as Mesa's do) have no darlingserver
-+	 * socket; mldr reports that as a broken pipe instead of aborting. Linux can
-+	 * deliver a process-directed signal such as SIGWINCH to such a thread. Any
-+	 * thread may handle an asynchronous signal, so forward it to the main thread.
-+	 * A synchronous fault in such a thread still takes the path below. */
-+	if (status == -32 /* -LINUX_EPIPE: no socket on this thread */ &&
-+	    !(info->si_code > 0 &&
-+	      (linux_signum == LINUX_SIGSEGV || linux_signum == LINUX_SIGBUS ||
-+	       linux_signum == LINUX_SIGILL || linux_signum == LINUX_SIGFPE ||
-+	       linux_signum == LINUX_SIGTRAP))) {
-+		long pid = LINUX_SYSCALL(__NR_getpid);
-+		if (LINUX_SYSCALL(__NR_gettid) != pid) {
-+			LINUX_SYSCALL(__NR_tgkill, pid, pid, linux_signum);
-+			return;
-+		}
-+	}
 +
 +#ifdef __x86_64__
 +	if (_lol_depth > 0) {
@@ -1765,7 +1789,7 @@ index 206e92e..011c8ca 100644
  	}
  
  	kern_printf("sigexc_handler(%d, %p, %p)\n", linux_signum, info, ctxt);
-@@ -359,7 +519,13 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
+@@ -359,7 +516,13 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
  						sizeof(sa.sa_mask));
  
  				// Resend signal to self
@@ -1780,6 +1804,27 @@ index 206e92e..011c8ca 100644
  			}
  		}
  	}
+diff --git a/darling/src/libsystem_kernel/emulation/src/linux_premigration/vchroot_userspace.c b/darling/src/libsystem_kernel/emulation/src/linux_premigration/vchroot_userspace.c
+index 2b72ad9..8433471 100644
+--- a/darling/src/libsystem_kernel/emulation/src/linux_premigration/vchroot_userspace.c
++++ b/darling/src/libsystem_kernel/emulation/src/linux_premigration/vchroot_userspace.c
+@@ -421,12 +421,14 @@ done_getdents:
+ 							ctxt->follow = true;
+ 							ctxt->symlink_depth++;
+ 
+-							// resolve absolute symlinks within the prefix
++							// Keep absolute host symlinks outside the prefix after crossing
++							// /Volumes/SystemRoot (e.g. /etc/resolv.conf -> /run/...).
++							// Resolve guest symlinks within the prefix
+ 							//
+ 							// however, DON'T resolve `/proc` symlinks within the prefix.
+ 							// anything under `/proc` is from Linux's `/proc` since we bind-mount it, so we can special-case them because we want those to be Linux-root relative.
+ 							// see https://github.com/darlinghq/darling/issues/1052 for the issue this works around.
+-							if (link[0] == '/' && !(strncmp(link, "/proc/", 6) == 0 || (rv == 5 && strncmp(link, "/proc", 5) == 0))) {
++							if (link[0] == '/' && ctxt->current_root_len > 0 && !(strncmp(link, "/proc/", 6) == 0 || (rv == 5 && strncmp(link, "/proc", 5) == 0))) {
+ 								ctxt->current_root = prefix_path;
+ 								ctxt->current_root_len = prefix_path_len;
+ 							}
 diff --git a/darling/src/libsystem_kernel/emulation/src/other/mach/lkm.c b/darling/src/libsystem_kernel/emulation/src/other/mach/lkm.c
 index 8c6d5d9..6fd1acf 100644
 --- a/darling/src/libsystem_kernel/emulation/src/other/mach/lkm.c
@@ -1868,6 +1913,99 @@ index 7d5ef80..46debb8 100644
  	[517] = sys_fclonefileat,
  	[521] = sys_abort_with_payload,
  	[524] = sys_setattrlistat,
+diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/ioctl/socket.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/ioctl/socket.c
+index f890ab2..21ae776 100644
+--- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/ioctl/socket.c
++++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/ioctl/socket.c
+@@ -2,12 +2,29 @@
+ 
+ #include <sys/errno.h>
+ #include <sys/socket.h>
+-#include <ifaddrs.h>
+ #include <net/if.h>
++#include <net/if_media.h>
+ #include <netinet/in.h>
+ #include <sys/sockio.h>
+ #include <netinet6/in6_var.h>
+ 
++#include <darling/emulation/xnu_syscall/bsd/impl/ioctl/ioctl.h>
++
++extern int strcmp(const char* a, const char* b);
++extern int strncmp(const char* a, const char* b, size_t n);
++extern char* strncpy(char* destination, const char* source, size_t length);
++
++#define LINUX_SIOCGIFFLAGS 0x8913
++#define LINUX_IFNAMSIZ 16
++
++struct linux_ifreq {
++	char lifr_name[LINUX_IFNAMSIZ];
++	union {
++		short lifr_flags;
++		char lifr_pad[24];
++	};
++};
++
+ int handle_socket(int fd, unsigned int cmd, void* arg, int* retval)
+ {
+ 	switch (cmd)
+@@ -19,6 +36,57 @@ int handle_socket(int fd, unsigned int cmd, void* arg, int* retval)
+ 		case SIOCAIFADDR_IN6: // set IPv6 address
+ 			*retval = -ENOTSUP;
+ 			return IOCTL_HANDLED;
++		case SIOCGIFMEDIA:
++#ifdef SIOCGIFXMEDIA
++		case SIOCGIFXMEDIA:
++#endif
++		{
++			struct ifmediareq* ifmr = (struct ifmediareq*) arg;
++			struct linux_ifreq ifr;
++			int status;
++
++			if (ifmr == NULL || ifmr->ifm_count < 0)
++			{
++				*retval = -EINVAL;
++				return IOCTL_HANDLED;
++			}
++
++			ifr.lifr_name[LINUX_IFNAMSIZ - 1] = '\0';
++			strncpy(ifr.lifr_name, ifmr->ifm_name, LINUX_IFNAMSIZ - 1);
++			status = __real_ioctl(fd, LINUX_SIOCGIFFLAGS, &ifr);
++			if (status < 0)
++			{
++				*retval = status;
++				return IOCTL_HANDLED;
++			}
++
++			if (ifr.lifr_flags & IFF_LOOPBACK)
++			{
++				*retval = -ENOTSUP;
++				return IOCTL_HANDLED;
++			}
++
++			if (strncmp(ifmr->ifm_name, "wl", 2) == 0)
++				ifmr->ifm_current = IFM_IEEE80211 | IFM_AUTO;
++			else
++				ifmr->ifm_current = IFM_ETHER | IFM_AUTO;
++			ifmr->ifm_mask = 0;
++			ifmr->ifm_status = ((ifr.lifr_flags & IFF_UP) && (ifr.lifr_flags & IFF_RUNNING))
++					? (IFM_AVALID | IFM_ACTIVE) : IFM_AVALID;
++			ifmr->ifm_active = ifmr->ifm_current;
++			if (ifmr->ifm_count > 0)
++			{
++				if (ifmr->ifm_ulist == NULL)
++				{
++					*retval = -EFAULT;
++					return IOCTL_HANDLED;
++				}
++				ifmr->ifm_ulist[0] = ifmr->ifm_current;
++			}
++			ifmr->ifm_count = 1;
++			*retval = 0;
++			return IOCTL_HANDLED;
++		}
+ 	}
+ 	return IOCTL_PASS;
+ }
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
 index f273989..058b985 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
@@ -4066,7 +4204,7 @@ index f26ec28..2f31473 100644
 +    return ret;
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/select/select.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/select/select.c
-index c3c33f9..831e8cb 100644
+index c3c33f9..fe8f722 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/select/select.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/select/select.c
 @@ -7,6 +7,168 @@
@@ -4169,7 +4307,7 @@ index c3c33f9..831e8cb 100644
 +{
 +	char argv0[512];
 +	const char* basename = argv0;
-+	const char* clients[] = { "LeagueClient", "RiotClientServices" };
++	const char* clients[] = { "LeagueClient", "LeagueClientUx", "RiotClientServices" }; /* Ux: CEF browser main thread, issue #82 */
 +	long fd, length;
 +	unsigned i, j;
 +	if (LINUX_SYSCALL(__NR_access, "/tmp/rclol-no-select-backoff", 0) == 0)
@@ -4932,7 +5070,7 @@ index c1b2d50..4e19963 100644
  	return ret;
  }
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c
-index b998456..c6281e6 100644
+index b998456..f09a94a 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c
 @@ -12,9 +12,28 @@
@@ -5080,7 +5218,7 @@ index b998456..c6281e6 100644
 + * (/tmp/rclol-local-semaphores, the former opt-in switch, is now a no-op). While it was on by default in every
 + * process (2026-10-10 22:22-23:50) LeagueClient died ~85 s after start in 3 of 4 checked launches
 + * ("mach_msg_overwrite failed -9", then dserver_rpc_interrupt_enter -9: its RPC descriptor had become invalid) and
-+ * the user saw Vanguard errors; that mechanism is not understood, so the clients keep the server path. With the
++ * the client logged integrity-check errors; that mechanism is not understood, so the clients keep the server path. With the
 + * lifetime fixes above the game ran two full matches with it (2026-10-14: the main thread's server waits fell from
 + * 1.36 to 0.10 ms per frame, 39 to 15 blocks per frame). /tmp/rclol-local-semaphores-all turns it on for every
 + * process (probe tests). Decided once per process and logged
@@ -6182,30 +6320,3 @@ index 0000000..f185f6c
 +__sysctlbyname:
 +    /* Just jump to the syscall stub */
 +    jmp ___sysctlbyname
-diff --git a/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
-new file mode 100644
-index 0000000..eb90f43
---- /dev/null
-+++ b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
-@@ -0,0 +1,21 @@
-+#ifndef DARLING_CPU_FREQUENCY_H
-+#define DARLING_CPU_FREQUENCY_H
-+#include <stdint.h>
-+#include <stdbool.h>
-+
-+// Linux cpufreq exposes kHz; Darwin's hw.cpufrequency is an unsigned 64-bit Hz value.
-+static inline bool darling_frequency_hz(const char* text, uint64_t* result)
-+{
-+    uint64_t value = 0;
-+    if (!text || !result || *text < '0' || *text > '9') return false;
-+    do {
-+        unsigned digit = (unsigned)(*text++ - '0');
-+        if (value > (UINT64_MAX - digit) / 10) return false;
-+        value = value * 10 + digit;
-+    } while (*text >= '0' && *text <= '9');
-+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') ++text;
-+    if (*text || !value || value > UINT64_MAX / 1000) return false;
-+    *result = value * 1000;
-+    return true;
-+}
-+#endif

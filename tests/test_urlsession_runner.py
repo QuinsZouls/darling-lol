@@ -23,15 +23,25 @@ with open(TRACE, 'a') as stream:
     stream.write(json.dumps({'args':sys.argv[1:], 'prefix':os.environ['DPREFIX']}) + '\\n')
 if sys.argv[1] == 'shutdown':
     raise SystemExit(0)
-assert urllib.request.urlopen(sys.argv[2]).read() == b'darling-session-ok'
+from pathlib import Path
+prefix = Path(os.environ['DPREFIX'])
+assert not prefix.exists(), 'Darling must receive an absent prefix for first-time initialization'
+prefix.mkdir()
+assert sys.argv[1:3] == ['shell', 'env']
+assert 'DYLD_FRAMEWORK_PATH' not in os.environ and 'DYLD_LIBRARY_PATH' not in os.environ
+urls = [arg for arg in sys.argv[1:] if arg.startswith('http://')]
+assert len(urls) == 2
+assert urllib.request.urlopen(urls[0]).read() == b'darling-session-ok'
 try:
-    urllib.request.urlopen(sys.argv[3], timeout=2)
+    urllib.request.urlopen(urls[1], timeout=2)
 except OSError:
     pass
 else:
     raise AssertionError('reserved error endpoint unexpectedly accepted a connection')
 print('LIFECYCLE_PASS: fixture')
 print('URLSESSION_PASS: fixture')
+print('SHARED_SESSION_PASS: fixture')
+print('QUEUE_PASS: fixture')
 ''')
             executable.chmod(0o755)
             probe = root / 'probe'
@@ -47,7 +57,7 @@ print('URLSESSION_PASS: fixture')
             self.assertEqual(calls[1]['args'], ['shutdown'])
             self.assertEqual(calls[0]['prefix'], calls[1]['prefix'])
             self.assertNotEqual(Path(calls[0]['prefix']), Path.home() / '.darling')
-            self.assertFalse(Path(calls[0]['prefix']).exists())
+            self.assertFalse(Path(calls[0]['prefix']).parent.exists())
             self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
 
 

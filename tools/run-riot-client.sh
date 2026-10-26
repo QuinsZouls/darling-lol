@@ -2,6 +2,11 @@
 # Launch Riot Client using the Darling runtime, without library injection.
 # Darling supplies Xlib Display pointers to EGL, so select X11 explicitly.
 set -eu
+# Native MangoHud uses the guest PID against the host /proc view and can abort
+# in GPU_fdinfo::find_fd (issue #38). Disable inherited implicit activation
+# before any helper can start Darling, including first-time installation.
+unset MANGOHUD
+export DISABLE_MANGOHUD=1
 # Native guest crashes created large system core files and exhausted this disk.
 # Address-only diagnostics suffice; bound this runner and its new namespace.
 if [ "${RCLOL_CORE_DUMPS:-0}" != 1 ]; then
@@ -26,6 +31,25 @@ export RCLOL_CDN_IPV4_ONLY="${RCLOL_CDN_IPV4_ONLY:-1}"
 # Anti-cheat: report a Mac-plausible GPU to client and game (opt-out: DARLING_METAL_GPU_NAME=)
 export DARLING_METAL_GPU_NAME="${DARLING_METAL_GPU_NAME-AMD Radeon Pro 5700 XT}"
 . "$runner_dir/runtime-paths.sh"
+# Opt-in partial recovery: if Darling is alive but a previous client tree is
+# windowless, stop only that client/CEF tree and reuse the runtime. Never
+# touches the game, darlingserver or the runtime sockets.
+if [ "${RCLOL_RECOVER_STALE_CLIENT:-0}" = 1 ]; then
+ python3 "$runner_dir/recover-stale-client.py"
+fi
+if [ "${RCLOL_RECOVER_HIDDEN_CLIENT:-0}" = 1 ]; then
+ python3 "$runner_dir/recover-hidden-riot-client.py"
+fi
+# Opt-in cleanup of helpers left by an earlier launcher. This runs before the
+# current helper is started. It removes only helpers of this prefix whose
+# parent is init/systemd, so a helper of a live launcher is not touched.
+if [ "${RCLOL_CLEAN_STALE_HELPERS:-0}" = 1 ]; then
+ python3 "$runner_dir/clean-stale-helpers.py" --prefix "$prefix_dir" ||
+  echo 'clean-stale-helpers: cleanup failed; continuing' >&2
+fi
+# The bundled downloader rejects IPv6 CONNECT_TO addresses. Only Riot CDN
+# AAAA lookups are suppressed; set this to 0 to retain the upstream resolver.
+export RCLOL_CDN_IPV4_ONLY="${RCLOL_CDN_IPV4_ONLY:-1}"
 python3 "$runner_dir/ensure-darling-runtime.py"
 python3 "$runner_dir/ensure-darling-service-accounts.py"
 python3 "$runner_dir/ensure-league-runtime-layout.py"
@@ -40,11 +64,21 @@ unset RCLOL_APP_ARG3 RCLOL_APP_ARG3_SLOT RCLOL_UX_ARG1 RCLOL_UX_ARG1_SLOT
 unset RCLOL_UX_ARG2 RCLOL_UX_ARG2_SLOT
 # The paired runtime presents completed GPU textures without CPU readback.
 # Explicit 0 or an empty value selects the CPU fallback for diagnostics.
-for option in RCLOL_GPU_DIRECT_PRESENT RCLOL_GPU_DIRECT_ASYNC RCLOL_GPU_DIRECT_VSYNC DARLING_CA_PRESENT_AT_COMMIT DARLING_CA_SKIP_LOCAL_IOSURFACE_RENDER RCLOL_FORWARD_MOUSE_MOVED RCLOL_MOUSE_CONFINEMENT; do
+# DARLING_METAL_MAC_GPU_NAME reports the MacBookPro16,1 GPU of the host vendor (AMD or Intel) as
+# MTLDevice.name, matching the model IOKit reports; memory figures stay the host's.
+# VRAM clamp: honor an explicit DARLING_METAL_VRAM_MB, otherwise pin 4096 MB so the
+# 5500M identity does not leak the host card's heap size.
+export DARLING_METAL_VRAM_MB="${DARLING_METAL_VRAM_MB:-4096}"
+for option in RCLOL_GPU_DIRECT_PRESENT RCLOL_GPU_DIRECT_ASYNC RCLOL_GPU_DIRECT_VSYNC DARLING_CA_PRESENT_AT_COMMIT DARLING_CA_SKIP_LOCAL_IOSURFACE_RENDER RCLOL_FORWARD_MOUSE_MOVED RCLOL_MOUSE_CONFINEMENT DARLING_METAL_MAC_GPU_NAME; do
  eval 'value=${'"$option"'-1}'
  case "$value" in 0|'') unset "$option";; *) export "$option=$value";; esac
 done
 prefix=$prefix_dir
+# Resolve the loader before the environment filter replaces PATH with the Mac layout.
+darling_bin=$(command -v darling) || {
+ echo 'darling loader not found in PATH' >&2
+ exit 1
+}
 # RIOT_GUEST_HOME is host-side; DYLD paths must be relative to the guest root.
 case "$guest_home" in
  "$prefix"/*) guest_path=/${guest_home#"$prefix"/} ;;
@@ -66,6 +100,33 @@ if [ -z "${RIOT_LAUNCHER_HOST:-}" ] && [ ! -e "$client" ]; then
   client=$shared
  else
   ln -s "../Users/Shared/Riot Games/Riot Client.app" "$client"
+ fi
+fi
+# Opt-in automatic client-in-game handling. Start the watcher only after the
+# installed-client check above: a failed installer launch must not leave a
+# helper behind. The preference selector returns no action for missing or
+# invalid close-during-game values.
+if [ -z "${RIOT_LAUNCHER_HOST:-}" ]; then
+ if [ "${RCLOL_CLIENT_IN_GAME_TRICKS:-0}" = 1 ]; then
+  pref="$prefix_dir/Applications/League of Legends.app/Contents/LoL/Config/LCULocalPreferences.yaml"
+  mode=$(python3 "$runner_dir/client-in-game-tricks.py" "$pref" 2>/dev/null || echo none)
+  case "$mode" in
+   close)
+    echo 'client-in-game-tricks: closeLeagueClientDuringGame=true -> close helper' >&2
+    python3 "$runner_dir/close-league-client-in-game.py" --detach &
+    ;;
+   hide)
+    echo 'client-in-game-tricks: closeLeagueClientDuringGame=false -> hide helper' >&2
+    python3 "$runner_dir/hide-league-client-in-game.py" --detach &
+    ;;
+   *)
+    echo 'client-in-game-tricks: no action (client optimizations disabled or preferences missing/invalid)' >&2
+    ;;
+  esac
+ elif [ "${RCLOL_CLOSE_CLIENT_IN_GAME:-0}" = 1 ]; then
+  python3 "$runner_dir/close-league-client-in-game.py" --detach &
+ elif [ "${RCLOL_HIDE_CLIENT_IN_GAME:-0}" = 1 ]; then
+  python3 "$runner_dir/hide-league-client-in-game.py" --detach &
  fi
 fi
 A=${RIOT_LAUNCHER_HOST:-"$client/Contents/MacOS/RiotClientServices"}
@@ -101,21 +162,40 @@ fi
 if [ -n "${RCLOL_REFRESH_HZ-}" ]; then export RCLOL_REFRESH_HZ; fi
 # Vulkan WSI & Mesa optimizations
 export MESA_NO_ERROR="${MESA_NO_ERROR:-1}"
+# Mesa resolves its shader disk cache below $HOME, which inside the guest is
+# /Users/<user>: that path does not exist on the host filesystem, so every process logs
+# "Failed to create /Users for shader cache (Permission denied)---disabling" and
+# recompiles every shader on start (212 such lines in one launcher log). The host Mesa
+# loaded into the guest reads MESA_SHADER_CACHE_DIR verbatim, so point it at a host
+# directory; Mesa creates mesa_shader_cache/ and radv_builtin_shaders/ below it.
+cache_root=${XDG_CACHE_HOME:-${HOME:-$prefix_dir}/.cache}/darling-lol
+MESA_SHADER_CACHE_DIR="${MESA_SHADER_CACHE_DIR:=$cache_root}"
+export MESA_SHADER_CACHE_DIR
+mkdir -p "$MESA_SHADER_CACHE_DIR" 2>/dev/null || true
 # NVIDIA proprietary driver: limit pre-rendered frames.
 export __GL_MaxFramesAllowed="${__GL_MaxFramesAllowed:-1}"
-export __GL_THREADED_OPTIMIZATIONS="${__GL_THREADED_OPTIMIZATIONS:-1}"
+# Threaded optimizations stay off: with them, NVIDIA 580 (the last branch for
+# Pascal GPUs) with egl-x11 1.0.6 rejects the X11 EGLDisplay with EGL_BAD_DISPLAY
+# on every thread that has a context current, and the game window stays black.
+export __GL_THREADED_OPTIMIZATIONS="${__GL_THREADED_OPTIMIZATIONS:-0}"
 export __GL_YIELD="${__GL_YIELD:-NOTHING}"
 # Reduce timer slack for tighter scheduling in the game process tree.
 if [ -w /proc/self/timerslack_ns ]; then
   echo 1 > /proc/self/timerslack_ns 2>/dev/null || true
 fi
-exec env -u ELECTRON_RUN_AS_NODE -u DYLD_INSERT_LIBRARIES EGL_PLATFORM=x11 \
+# On affected setups Chromium's default temp directory is unusable. Electron
+# can copy app.asar entries to temporary files for async reads and report a
+# failed copy as "not found". Use a writable guest directory by default.
+# exec-guest.py closes host file descriptors above stderr before starting the guest. A shell
+# loop cannot: dash only accepts single-digit descriptors in redirections.
+exec python3 "$runner_dir/exec-guest.py" env -u ELECTRON_RUN_AS_NODE -u DYLD_INSERT_LIBRARIES EGL_PLATFORM=x11 \
+  MAC_CHROMIUM_TMPDIR="${MAC_CHROMIUM_TMPDIR:-/private/tmp}" \
   LANG="${RCLOL_GUEST_LOCALE:-en_US.UTF-8}" LC_ALL="${RCLOL_GUEST_LOCALE:-en_US.UTF-8}" \
   mesa_glthread="${RCLOL_MESA_GLTHREAD-${mesa_glthread-false}}" \
   XMODIFIERS="${RCLOL_XMODIFIERS:-@im=none}" DISPLAY="${DISPLAY:-:1}" \
   DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-$guest_path/RuntimeLibraries}" \
   DYLD_FRAMEWORK_PATH="${DYLD_FRAMEWORK_PATH:-$guest_path/RuntimeFrameworks}" \
   DARLING_XSHM_LIBRARY="${DARLING_XSHM_LIBRARY:-$guest_path/libDarlingXShm.dylib}" \
-  darling "$A" --region="${RCLOL_REGION:-EUW}" --locale="${RCLOL_LOCALE:-en_GB}" \
+  "$darling_bin" "$A" --region="${RCLOL_REGION:-EUW}" --locale="${RCLOL_LOCALE:-en_GB}" \
     "$@" \
     --log-dir="$guest_path/Library/Logs/Riot Games/Riot Client"
